@@ -498,9 +498,15 @@ impl Pairing {
                 .set_identity_key();
         }
 
-        // Always agree to distribute identity key when the peer requests it,
-        // even without a local IRK — we'll send a zero IRK with our identity address.
-        if peer_features.responder_key_distribution.identity_key() {
+        // Only agree to distribute our identity key (IRK) when we ACTUALLY have a
+        // non-zero IRK. Upstream always agreed and then sent a zero IRK + our
+        // identity address; macOS/iOS reject that with PairingFailed("unspecified
+        // reason"), aborting the bond right after `Link encrypted!`. A
+        // fixed-address peripheral (no rotating RPA) has no IRK to share, so we
+        // decline — bonding still completes with the LE-Secure-Connections LTK,
+        // and the central simply can't resolve an RPA we never use. (Helius
+        // FW-BLE-SEC-1 fix; the central's own identity key is still accepted below.)
+        if peer_features.responder_key_distribution.identity_key() && ops.local_irk() != [0u8; 16] {
             pairing_data
                 .local_features
                 .responder_key_distribution
