@@ -398,6 +398,19 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
             if Some(h) == storage.handle && storage.state != ConnectionState::Disconnected {
                 storage.state = ConnectionState::Disconnected;
                 storage.reassembly.clear();
+                // FW-M8: wake any TxRunner future parked in `poll_request_to_send`
+                // awaiting link credits for THIS handle. On disconnect the controller
+                // may not emit a Number-Of-Completed-Packets for the flushed in-flight
+                // packets, so `confirm_sent` (the only other waker of
+                // `link_credit_waker`, besides a `PacketGrant` drop) can never fire —
+                // the outbound send future then stays `Pending` forever and, because
+                // the `TxRunner` shares ONE outbound queue across all connections, it
+                // head-of-line-blocks EVERY other connection's GATT replies/notifies
+                // until supervision timeout. Waking here makes the future re-poll,
+                // observe `state == Disconnected`, and return `Err(NotFound)` — which
+                // `TxRunner::run` already handles as "unable to send to disconnected
+                // host (ignored)" — so the queue head clears immediately.
+                storage.link_credit_waker.wake();
                 let _ = storage.events.try_send(ConnectionEvent::Disconnected { reason });
                 #[cfg(feature = "gatt")]
                 {
