@@ -302,10 +302,13 @@ where
         Poll::Pending
     }
 
-    /// Check whether BLE address privacy is enabled.
+    /// Check whether BLE address privacy (rotating RPA + resolving list) is
+    /// enabled. This is TRUE only when `enable_privacy` was used — NOT when the
+    /// IRK is merely being distributed during bonding via
+    /// `distribute_identity_key` (which keeps a fixed advertising address).
     #[cfg(feature = "security")]
     pub(crate) fn is_privacy_enabled(&self) -> bool {
-        self.connections.security_manager.get_local_irk().is_some()
+        self.connections.security_manager.is_own_rpa_enabled()
     }
 
     /// Get the appropriate own address kind based on the host address and privacy state.

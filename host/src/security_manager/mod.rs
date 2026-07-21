@@ -111,8 +111,20 @@ struct SecurityManagerData {
     local_address: Option<Address>,
     /// Random generator seeded
     random_generator_seeded: bool,
-    /// Local Identity Resolving Key (set when privacy is enabled)
+    /// Local Identity Resolving Key. Set whenever we advertise our IRK — either
+    /// because full RPA privacy is enabled (`enable_privacy`) OR because we only
+    /// want to DISTRIBUTE the IRK during bonding while keeping a fixed
+    /// (static/public) advertising address (`distribute_identity_key`). The SMP
+    /// key-distribution decision keys off this being non-zero; RPA address usage
+    /// keys off `own_rpa_enabled` below, so the two are independent.
     local_irk: Option<IdentityResolvingKey>,
+    /// Whether our OWN advertising address should be a rotating Resolvable
+    /// Private Address (true) vs. the fixed address configured via
+    /// `set_random_address` (false). Only `enable_privacy` sets this; a plain
+    /// `distribute_identity_key` leaves it false so the IRK is shared during
+    /// bonding without switching the on-air address to an RPA. This is what
+    /// lets us match Meshtastic (fixed address + IRK distribution).
+    own_rpa_enabled: bool,
 }
 
 impl SecurityManagerData {
@@ -122,6 +134,7 @@ impl SecurityManagerData {
             local_address: None,
             random_generator_seeded: false,
             local_irk: None,
+            own_rpa_enabled: false,
         }
     }
 }
@@ -749,15 +762,35 @@ impl<'d> SecurityManager<'d> {
         self.inner.borrow().state.local_address
     }
 
-    /// Set the local Identity Resolving Key (IRK) for privacy.
+    /// Set the local Identity Resolving Key (IRK) for FULL RPA privacy: our own
+    /// advertising address becomes a rotating Resolvable Private Address AND the
+    /// IRK is distributed during bonding. Used by `Stack::enable_privacy`.
     pub(crate) fn set_local_irk(&self, irk: IdentityResolvingKey) {
+        let mut inner = self.inner.borrow_mut();
+        inner.state.local_irk = Some(irk);
+        inner.state.own_rpa_enabled = true;
+    }
+
+    /// Set the local IRK for DISTRIBUTION-ONLY: the IRK is shared during bonding
+    /// (so centrals like Android/iOS complete a full LE-Secure-Connections bond),
+    /// but our advertising address stays the fixed one from `set_random_address`
+    /// (NO rotating RPA, NO resolving-list machinery). Matches Meshtastic's
+    /// fixed-address + IRK-distribution behavior. `own_rpa_enabled` is left
+    /// false, so `Host::is_privacy_enabled()` stays false.
+    pub(crate) fn distribute_identity_key(&self, irk: IdentityResolvingKey) {
         self.inner.borrow_mut().state.local_irk = Some(irk);
     }
 
     /// Get the local Identity Resolving Key (IRK).
-    /// Returns `Some` when privacy is enabled, `None` otherwise.
+    /// Returns `Some` when an IRK is configured (privacy OR distribution-only).
     pub(crate) fn get_local_irk(&self) -> Option<IdentityResolvingKey> {
         self.inner.borrow().state.local_irk
+    }
+
+    /// Whether our OWN advertising address should be a rotating RPA. Only true
+    /// when `enable_privacy` was used; `distribute_identity_key` leaves it false.
+    pub(crate) fn is_own_rpa_enabled(&self) -> bool {
+        self.inner.borrow().state.own_rpa_enabled
     }
 
     /// Add a bonded device
