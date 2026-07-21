@@ -353,7 +353,7 @@ pub struct NumCompare(pub u32);
 #[derive(Clone)]
 #[must_use]
 #[repr(transparent)]
-pub struct SecretKey(p256::NonZeroScalar);
+pub struct SecretKey(p256_cortex_m4::SecretKey);
 
 impl core::fmt::Debug for SecretKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -373,20 +373,20 @@ impl SecretKey {
     #[allow(clippy::new_without_default)]
     #[inline(always)]
     pub fn new<T: RngCore + CryptoRng>(rng: &mut T) -> Self {
-        Self(p256::NonZeroScalar::random(rng))
+        Self(p256_cortex_m4::SecretKey::random(&mut *rng))
     }
 
     /// Computes the associated public key.
     pub fn public_key(&self) -> PublicKey {
-        use p256::elliptic_curve::sec1::Coordinates::Uncompressed;
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
-        let p = p256::PublicKey::from_secret_scalar(&self.0).to_encoded_point(false);
-        match p.coordinates() {
-            Uncompressed { x, y } => PublicKey {
-                x: PublicKeyX(Coord(*x.as_ref())),
-                y: Coord(*y.as_ref()),
-            },
-            _ => unreachable!("invalid secret key"),
+        // Uncompressed SEC1 without the 0x04 tag = x-coord ‖ y-coord, both 32B big-endian.
+        let ut = self.0.public_key().to_untagged_bytes();
+        let mut x = [0u8; 32];
+        let mut y = [0u8; 32];
+        x.copy_from_slice(&ut[..32]);
+        y.copy_from_slice(&ut[32..]);
+        PublicKey {
+            x: PublicKeyX(Coord(x)),
+            y: Coord(y),
         }
     }
 
@@ -395,18 +395,25 @@ impl SecretKey {
     /// from the same secret key ([Vol 3] Part H, Section 2.3.5.6.1).
     #[must_use]
     pub fn dh_key(&self, pk: PublicKey) -> Option<DHKey> {
-        use p256::elliptic_curve::sec1::FromEncodedPoint;
         if pk.is_debug() {
             return None; // TODO: Compile-time option for debug-only mode
         }
-
-        let (x, y) = (&pk.x.0 .0.into(), &pk.y.0.into());
-        let rep = p256::EncodedPoint::from_affine_coordinates(x, y, false);
-        let lpk = p256::PublicKey::from_secret_scalar(&self.0);
-        // Constant-time ops not required:
-        // https://github.com/RustCrypto/traits/issues/1227
-        let rpk = Option::from(p256::PublicKey::from_encoded_point(&rep)).unwrap_or(lpk);
-        (rpk != lpk).then(|| DHKey(ecdh::diffie_hellman(&self.0, rpk.as_affine())))
+        // Rebuild the peer public key from its x‖y coordinates (untagged SEC1).
+        let mut ut = [0u8; 64];
+        ut[..32].copy_from_slice(&pk.x.0 .0);
+        ut[32..].copy_from_slice(&pk.y.0);
+        let peer = p256_cortex_m4::PublicKey::from_untagged_bytes(&ut).ok()?;
+        // Reject a peer key equal to our own ([Vol 3] Part H, 2.3.5.6.1).
+        let ours = self.0.public_key().to_untagged_bytes();
+        if peer.to_untagged_bytes() == ours {
+            return None;
+        }
+        let ss = self.0.agree(&peer);
+        // Wrap the ECDH x-coordinate back into the RustCrypto SharedSecret type
+        // that the f5/f6 key-derivation downstream expects (byte-identical).
+        let mut fb = p256::FieldBytes::default();
+        fb.copy_from_slice(ss.as_bytes());
+        Some(DHKey(ecdh::SharedSecret::from(fb)))
     }
 }
 
@@ -787,7 +794,7 @@ mod tests {
 
     #[inline]
     fn secret_key(hi: u128, lo: u128) -> SecretKey {
-        SecretKey(p256::NonZeroScalar::from_repr(u256(hi, lo)).unwrap())
+        SecretKey(p256_cortex_m4::SecretKey::from_bytes(u256::<p256::FieldBytes>(hi, lo)).unwrap())
     }
 
     #[inline]
