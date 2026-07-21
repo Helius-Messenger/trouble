@@ -4,6 +4,8 @@
 
 mod constants;
 pub(crate) mod crypto;
+#[cfg(feature = "security-p256-cortex-m4")]
+mod p256_cortex_m4;
 mod pairing;
 mod types;
 use core::cell::{Ref, RefCell};

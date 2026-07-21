@@ -39,6 +39,20 @@ zerocopy = "0.8.21"
 log = { version = "0.4.16", optional = true }
 defmt = { version = "1.0.1", optional = true }
 
+# p256-cortex-m4: hand-optimized ARMv7E-M assembly P-256 (Emil Lenngren's
+# P256-Cortex-M4), registered as the `embassy-crypto` P-256 ECDH driver by the
+# `security-p256-cortex-m4` feature. On Cortex-M4/M33 its build.rs sets
+# `--cfg cortex_m4` and it uses the asm; elsewhere the `non-cortex-m4-fallback`
+# feature re-exports the generic `p256` crate with the SAME API, so host builds
+# exercise the same driver code. Declared per-target so the M4 build does NOT
+# pull the fallback's second `p256` copy into flash.
+[target.'cfg(all(target_arch = "arm", target_os = "none"))'.dependencies]
+p256-cortex-m4 = { version = "0.1.0-alpha.6", default-features = false, optional = true }
+zeroize = { version = "1", default-features = false, optional = true }
+
+[target.'cfg(not(all(target_arch = "arm", target_os = "none")))'.dependencies]
+p256-cortex-m4 = { version = "0.1.0-alpha.6", default-features = false, features = ["non-cortex-m4-fallback"], optional = true }
+
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = [
   "time",
@@ -86,6 +100,13 @@ connection-metrics = []
 # Enable additional channel metrics
 channel-metrics = []
 security = ["dep:embassy-crypto"]
+# Register `p256-cortex-m4` (assembly, ~30x faster on Cortex-M4/M33) as the
+# global `embassy-crypto` P-256 ECDH driver used for LESC pairing. The
+# application must then NOT register another P-256 ECDH driver (e.g. drop
+# `embassy-crypto-rustcrypto`'s `embassy-crypto-p256-ecdh` feature) or linking
+# fails with duplicate `_embassy_crypto_p256_ecdh_*` symbols. AES and RNG
+# drivers are still the application's to provide.
+security-p256-cortex-m4 = ["security", "dep:p256-cortex-m4", "dep:zeroize"]
 # Enable LE Legacy Pairing (BLE 4.0/4.1 fallback when peer doesn't support Secure Connections)
 legacy-pairing = ["security"]
 # Enable Isochronous endpoint support
