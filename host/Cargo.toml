@@ -1,6 +1,6 @@
 [package]
 name = "trouble-host"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "An async Rust BLE host"
 license = "Apache-2.0 OR MIT"
@@ -23,7 +23,7 @@ targets = ["thumbv7em-none-eabi"]
 
 [dependencies]
 aes = { version = "0.8.2", optional = true }
-bt-hci = { version = "0.8", features = ["uuid"] }
+bt-hci = { version = "0.9", features = ["uuid"] }
 cmac = { version = "0.7.2", optional = true }
 embedded-io = { version = "0.7" }
 embassy-sync = "0.8"
@@ -31,9 +31,9 @@ embassy-time = "0.5.1"
 embassy-futures = "0.1"
 futures = { version = "0.3", default-features = false }
 heapless = "0.9"
-trouble-host-macros = { path = "../host-macros", version = "0.4.0", optional = true }
+trouble-host-macros = { path = "../host-macros", version = "0.5.0", optional = true }
 p256 = { version = "0.13.2", default-features = false, features = ["ecdh","arithmetic"], optional = true }
-rand_core = "0.6"
+rand_core = { version = "0.6", optional = true }
 rand_chacha = { version = "0.3", default-features = false, optional = true }
 rand = { version="0.8", default-features = false, optional = true}
 serde = { version = "1.0.228", optional = true, default-features = false, features = ["derive"] }
@@ -43,19 +43,6 @@ zerocopy = "0.8.21"
 # Logging
 log = { version = "0.4.16", optional = true }
 defmt = { version = "1.0.1", optional = true }
-
-# p256-cortex-m4: fast P-256 ECDH for LESC pairing via hand-optimized ARMv7E-M
-# assembly (Emil Lenngren's P256-Cortex-M4). On the M4/M33 target its build.rs
-# sets `--cfg cortex_m4` and it uses the asm (p256-cortex-m4-sys); on any other
-# target the `non-cortex-m4-fallback` feature re-exports the generic `p256` crate
-# with the SAME API — so host `cargo test` exercises (and validates) the plumbing
-# against the reference impl. Declared per-target so the M4 build does NOT pull the
-# fallback's second `p256` (0.9) copy into flash.
-[target.'cfg(all(target_arch = "arm", target_os = "none"))'.dependencies]
-p256-cortex-m4 = { version = "0.1.0-alpha.6", default-features = false, optional = true }
-
-[target.'cfg(not(all(target_arch = "arm", target_os = "none")))'.dependencies]
-p256-cortex-m4 = { version = "0.1.0-alpha.6", default-features = false, features = ["non-cortex-m4-fallback"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = [
@@ -94,12 +81,11 @@ controller-host-flow-control = []
 connection-metrics = []
 # Enable additional channel metrics
 channel-metrics = []
-security = [ "dep:p256", "dep:p256-cortex-m4", "dep:aes", "dep:cmac", "dep:rand_chacha", "dep:rand" ]
+security = [ "dep:p256", "dep:aes", "dep:cmac", "dep:rand_core", "dep:rand_chacha", "dep:rand" ]
 # Enable LE Legacy Pairing (BLE 4.0/4.1 fallback when peer doesn't support Secure Connections)
 legacy-pairing = ["security"]
-# For development. Disable security manager cryptographically secure pseudorandom number
-# generator (CSPRNG) to require a cryptographically secure seed
-dev-disable-csprng-seed-requirement = []
+# Enable Isochronous endpoint support
+iso = []
 
 # Enable ATT queued writes (long characteristic writes)
 att-queued-writes = ["gatt"]

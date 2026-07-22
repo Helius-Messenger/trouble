@@ -7,8 +7,8 @@ use bt_hci::cmd::le::{
 use bt_hci::cmd::status::ReadRssi;
 use bt_hci::controller::{ControllerCmdAsync, ControllerCmdSync};
 use bt_hci::param::{
-    AllPhys, ConnHandle, DisconnectReason, FrameSpaceInitiator, LeConnRole, PhyKind, PhyMask, PhyOptions, SpacingTypes,
-    Status,
+    AllPhys, ConnHandle, DisconnectReason, FilterDuplicates, FrameSpaceInitiator, LeConnRole, PhyKind, PhyMask,
+    PhyOptions, SpacingTypes, Status,
 };
 #[cfg(feature = "connection-params-update")]
 use bt_hci::{
@@ -19,9 +19,9 @@ use bt_hci::{
 use embassy_sync::blocking_mutex::raw::RawMutex;
 use embassy_time::Duration;
 
-use crate::connection_manager::ConnectionManager;
 #[cfg(feature = "connection-metrics")]
 pub use crate::connection_manager::Metrics as ConnectionMetrics;
+use crate::connection_manager::{ConnectionManager, ConnectionState};
 use crate::pdu::Pdu;
 #[cfg(feature = "gatt")]
 use crate::prelude::{AttributeServer, GattConnection};
@@ -80,6 +80,8 @@ pub struct ScanConfig<'d> {
     pub window: Duration,
     /// Scan timeout.
     pub timeout: Duration,
+    /// Duplicate advertising filtering.
+    pub filter_duplicates: FilterDuplicates,
 }
 
 impl Default for ScanConfig<'_> {
@@ -91,6 +93,7 @@ impl Default for ScanConfig<'_> {
             interval: Duration::from_secs(1),
             window: Duration::from_secs(1),
             timeout: Duration::from_secs(0),
+            filter_duplicates: FilterDuplicates::Disabled,
         }
     }
 }
@@ -280,6 +283,8 @@ pub enum ConnectionEvent {
     Encrypted {
         /// Security level achieved by the encryption.
         security_level: SecurityLevel,
+        /// Bond information if encryption was achieved using a stored bond.
+        bond: Option<BondInformation>,
     },
     #[cfg(feature = "security")]
     /// OOB data is requested during pairing. Respond with [`Connection::provide_oob_data()`].
@@ -338,10 +343,14 @@ impl ConnectionParamsRequest {
             return self.reject(stack).await;
         }
 
-        match stack.host.async_command(into_le_conn_update(self.handle, params)).await {
+        match stack
+            .host()
+            .async_command(into_le_conn_update(self.handle, params))
+            .await
+        {
             Ok(()) => {
                 let param = ConnParamUpdateRes { result: 0 };
-                stack.host.send_conn_param_update_res(self.handle, &param).await
+                stack.host().send_conn_param_update_res(self.handle, &param).await
             }
             Err(BleHostError::BleHost(crate::Error::Hci(bt_hci::param::Error::UNKNOWN_CONN_IDENTIFIER))) => {
                 Err(crate::Error::Disconnected.into())
@@ -363,7 +372,7 @@ impl ConnectionParamsRequest {
     {
         self.responded = true;
         let param = ConnParamUpdateRes { result: 1 };
-        stack.host.send_conn_param_update_res(self.handle, &param).await
+        stack.host().send_conn_param_update_res(self.handle, &param).await
     }
 }
 
@@ -389,18 +398,22 @@ impl ConnectionParamsRequest {
             return self.reject(stack).await;
         }
 
-        match stack.host.async_command(into_le_conn_update(self.handle, params)).await {
+        match stack
+            .host()
+            .async_command(into_le_conn_update(self.handle, params))
+            .await
+        {
             Ok(()) => {
                 if self.l2cap {
                     // Use L2CAP signaling to update connection parameters
                     let param = ConnParamUpdateRes { result: 0 };
-                    stack.host.send_conn_param_update_res(self.handle, &param).await
+                    stack.host().send_conn_param_update_res(self.handle, &param).await
                 } else {
                     let interval_min: bt_hci::param::Duration<1_250> = bt_hci_duration(params.min_connection_interval);
                     let interval_max: bt_hci::param::Duration<1_250> = bt_hci_duration(params.max_connection_interval);
                     let timeout: bt_hci::param::Duration<10_000> = bt_hci_duration(params.supervision_timeout);
                     stack
-                        .host
+                        .host()
                         .async_command(LeRemoteConnectionParameterRequestReply::new(
                             self.handle,
                             interval_min,
@@ -434,10 +447,10 @@ impl ConnectionParamsRequest {
         self.responded = true;
         if self.l2cap {
             let param = ConnParamUpdateRes { result: 1 };
-            stack.host.send_conn_param_update_res(self.handle, &param).await
+            stack.host().send_conn_param_update_res(self.handle, &param).await
         } else {
             stack
-                .host
+                .host()
                 .async_command(LeRemoteConnectionParameterRequestNegativeReply::new(
                     self.handle,
                     RemoteConnectionParamsRejectReason::UnacceptableConnParameters,
@@ -486,6 +499,27 @@ pub struct Connection<'stack, P: PacketPool> {
     manager: &'stack ConnectionManager<'stack, P>,
 }
 
+impl<P: PacketPool> core::fmt::Debug for Connection<'_, P> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Connection").field(&self.index).finish()
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl<P: PacketPool> defmt::Format for Connection<'_, P> {
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(f, "Connection({})", self.index)
+    }
+}
+
+impl<P: PacketPool> PartialEq for Connection<'_, P> {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index && core::ptr::eq(self.manager, other.manager)
+    }
+}
+
+impl<P: PacketPool> Eq for Connection<'_, P> {}
+
 impl<P: PacketPool> Clone for Connection<'_, P> {
     fn clone(&self) -> Self {
         self.manager.inc_ref(self.index);
@@ -504,12 +538,24 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
         Self { index, manager }
     }
 
+    pub(crate) fn manager(&self) -> &ConnectionManager<'stack, P> {
+        self.manager
+    }
+
+    pub(crate) fn index(&self) -> u8 {
+        self.index
+    }
+
     pub(crate) fn set_att_mtu(&self, mtu: u16) {
         self.manager.set_att_mtu(self.index, mtu);
     }
 
     pub(crate) fn get_att_mtu(&self) -> u16 {
         self.manager.get_att_mtu(self.index)
+    }
+
+    pub(crate) fn is_att_mtu_exchanged(&self) -> bool {
+        self.manager.is_att_mtu_exchanged(self.index)
     }
 
     pub(crate) fn set_l2cap_listening(&self, listening: bool) {
@@ -541,6 +587,25 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
     #[cfg(feature = "gatt")]
     pub(crate) async fn next_gatt_client(&self) -> Option<Pdu<P::Packet>> {
         self.manager.next_gatt_client(self.index).await
+    }
+
+    #[cfg(feature = "gatt")]
+    pub(crate) async fn acquire_indication_slot(&self) -> Result<(), Error> {
+        self.manager.acquire_indication_slot(self.index).await
+    }
+
+    #[cfg(feature = "gatt")]
+    pub(crate) fn release_indication_slot(&self) {
+        self.manager.release_indication_slot(self.index)
+    }
+
+    #[cfg(feature = "gatt")]
+    pub(crate) async fn wait_indication_confirmation(&self) -> Result<(), Error> {
+        self.manager.wait_indication_confirmation(self.index).await
+    }
+
+    pub(crate) fn state(&self) -> ConnectionState {
+        self.manager.state(self.index)
     }
 
     /// Check if still connected
@@ -712,7 +777,7 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
         T: ControllerCmdSync<ReadRssi>,
     {
         let handle = self.handle();
-        let ret = stack.host.command(ReadRssi::new(handle)).await?;
+        let ret = stack.host().command(ReadRssi::new(handle)).await?;
         Ok(ret.rssi)
     }
 
@@ -749,7 +814,7 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
             }
         }
         stack
-            .host
+            .host()
             .async_command(LeSetPhy::new(self.handle(), all_phys, mask, mask, options))
             .await?;
         Ok(())
@@ -760,7 +825,7 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
     where
         T: ControllerCmdSync<LeReadPhy>,
     {
-        let res = stack.host.command(LeReadPhy::new(self.handle())).await?;
+        let res = stack.host().command(LeReadPhy::new(self.handle())).await?;
         Ok((res.tx_phy, res.rx_phy))
     }
 
@@ -776,9 +841,13 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
     {
         let handle = self.handle();
         // First, check the local supported features to ensure that the connection update is supported.
-        let features = stack.host.command(LeReadLocalSupportedFeatures::new()).await?;
+        let features = stack.host().command(LeReadLocalSupportedFeatures::new()).await?;
         if length <= 27 || features.supports_le_data_packet_length_extension() {
-            match stack.host.command(LeSetDataLength::new(handle, length, time_us)).await {
+            match stack
+                .host()
+                .command(LeSetDataLength::new(handle, length, time_us))
+                .await
+            {
                 Ok(_) => Ok(()),
                 Err(BleHostError::BleHost(crate::Error::Hci(bt_hci::param::Error::UNKNOWN_CONN_IDENTIFIER))) => {
                     Err(crate::Error::Disconnected.into())
@@ -801,9 +870,9 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
     {
         let handle = self.handle();
         // First, check the local supported features to ensure that the connection update is supported.
-        let features = stack.host.command(LeReadLocalSupportedFeatures::new()).await?;
+        let features = stack.host().command(LeReadLocalSupportedFeatures::new()).await?;
         if features.supports_conn_parameters_request_procedure() || self.role() == LeConnRole::Central {
-            match stack.host.async_command(into_le_conn_update(handle, params)).await {
+            match stack.host().async_command(into_le_conn_update(handle, params)).await {
                 Ok(_) => return Ok(()),
                 Err(BleHostError::BleHost(crate::Error::Hci(bt_hci::param::Error::UNKNOWN_CONN_IDENTIFIER))) => {
                     return Err(crate::Error::Disconnected.into());
@@ -821,7 +890,7 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
         if self.role() == LeConnRole::Peripheral || cfg!(feature = "connection-params-update") {
             use crate::types::l2cap::ConnParamUpdateReq;
             // Use L2CAP signaling to update connection parameters
-            info!(
+            debug!(
                 "Connection parameters request procedure not supported, use l2cap connection parameter update req instead"
             );
             let interval_min: bt_hci::param::Duration<1_250> = bt_hci_duration(params.min_connection_interval);
@@ -833,7 +902,7 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
                 latency: params.max_latency,
                 timeout: timeout.as_u16(),
             };
-            stack.host.send_conn_param_update_req(handle, &param).await?;
+            stack.host().send_conn_param_update_req(handle, &param).await?;
         }
         Ok(())
     }
@@ -854,7 +923,7 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
         let frame_space_min_dur = bt_hci_duration(frame_space_min);
         let frame_space_max_dur = bt_hci_duration(frame_space_max);
         match stack
-            .host
+            .host()
             .command(LeFrameSpaceUpdate::new(
                 handle,
                 frame_space_min_dur,
@@ -888,7 +957,7 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
         let min_ce = bt_hci_duration(conn_rate_params.min_ce_length);
         let max_ce = bt_hci_duration(conn_rate_params.max_ce_length);
         match stack
-            .host
+            .host()
             .command(LeConnectionRateRequest::new(
                 handle,
                 min_interval,

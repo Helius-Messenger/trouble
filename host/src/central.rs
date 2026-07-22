@@ -3,7 +3,7 @@ use bt_hci::cmd::le::{
     LeAddDeviceToFilterAcceptList, LeClearFilterAcceptList, LeCreateConn, LeExtCreateConn, LeSetDefaultRateParameters,
 };
 use bt_hci::controller::{Controller, ControllerCmdAsync, ControllerCmdSync};
-use bt_hci::param::{AddrKind, BdAddr, InitiatingPhy, LeConnRole, PhyParams};
+use bt_hci::param::{InitiatingPhy, LeConnRole, PhyParams};
 use embassy_futures::select::{select, Either};
 
 use crate::connection::{ConnectConfig, ConnectRateParams, Connection, PhySet};
@@ -12,11 +12,11 @@ use crate::{bt_hci_duration, Address, BleHostError, Error, PacketPool};
 
 /// A type implementing the BLE central role.
 pub struct Central<'stack, C, P: PacketPool> {
-    pub(crate) host: &'stack BleHost<'stack, C, P>,
+    pub(crate) host: BleHost<'stack, C, P>,
 }
 
 impl<'stack, C: Controller, P: PacketPool> Central<'stack, C, P> {
-    pub(crate) fn new(host: &'stack BleHost<'stack, C, P>) -> Self {
+    pub(crate) fn new(host: BleHost<'stack, C, P>) -> Self {
         Self { host }
     }
 
@@ -33,18 +33,23 @@ impl<'stack, C: Controller, P: PacketPool> Central<'stack, C, P> {
 
         let host = self.host;
         let _drop = crate::host::OnDrop::new(|| {
-            host.connect_command_state.cancel(true);
+            host.connect_command_state().cancel(false);
         });
-        host.connect_command_state.request().await;
+        host.request_operation(host.connect_command_state(), false).await;
 
-        self.set_accept_filter(config.scan_config.filter_accept_list).await?;
+        let peer = if config.scan_config.filter_accept_list.len() == 1 {
+            config.scan_config.filter_accept_list[0]
+        } else {
+            self.set_accept_filter(config.scan_config.filter_accept_list).await?;
+            Address::default()
+        };
 
         host.async_command(LeCreateConn::new(
             bt_hci_duration(config.scan_config.interval),
             bt_hci_duration(config.scan_config.window),
-            true,
-            AddrKind::PUBLIC,
-            BdAddr::default(),
+            config.scan_config.filter_accept_list.len() > 1,
+            peer.kind,
+            peer.addr,
             host.own_addr_kind(),
             bt_hci_duration(config.connect_params.min_connection_interval),
             bt_hci_duration(config.connect_params.max_connection_interval),
@@ -55,15 +60,15 @@ impl<'stack, C: Controller, P: PacketPool> Central<'stack, C, P> {
         ))
         .await?;
         match select(
-            host.connections
+            host.connections()
                 .accept(LeConnRole::Central, config.scan_config.filter_accept_list),
-            host.connect_command_state.wait_idle(),
+            host.connect_command_state().wait_idle(),
         )
         .await
         {
             Either::First(conn) => {
                 _drop.defuse();
-                host.connect_command_state.done();
+                host.connect_command_state().done();
                 Ok(conn)
             }
             Either::Second(_) => Err(Error::Timeout.into()),
@@ -87,11 +92,16 @@ impl<'stack, C: Controller, P: PacketPool> Central<'stack, C, P> {
         let host = self.host;
         // Ensure no other connect ongoing.
         let _drop = crate::host::OnDrop::new(|| {
-            host.connect_command_state.cancel(true);
+            host.connect_command_state().cancel(true);
         });
-        host.connect_command_state.request().await;
+        host.request_operation(host.connect_command_state(), true).await;
 
-        self.set_accept_filter(config.scan_config.filter_accept_list).await?;
+        let peer = if config.scan_config.filter_accept_list.len() == 1 {
+            config.scan_config.filter_accept_list[0]
+        } else {
+            self.set_accept_filter(config.scan_config.filter_accept_list).await?;
+            Address::default()
+        };
 
         let initiating = InitiatingPhy {
             scan_interval: bt_hci_duration(config.scan_config.interval),
@@ -106,24 +116,24 @@ impl<'stack, C: Controller, P: PacketPool> Central<'stack, C, P> {
         let phy_params = create_phy_params(initiating, config.scan_config.phys);
 
         host.async_command(LeExtCreateConn::new(
-            true,
+            config.scan_config.filter_accept_list.len() > 1,
             host.own_addr_kind(),
-            AddrKind::PUBLIC,
-            BdAddr::default(),
+            peer.kind,
+            peer.addr,
             phy_params,
         ))
         .await?;
 
         match select(
-            host.connections
+            host.connections()
                 .accept(LeConnRole::Central, config.scan_config.filter_accept_list),
-            host.connect_command_state.wait_idle(),
+            host.connect_command_state().wait_idle(),
         )
         .await
         {
             Either::First(conn) => {
                 _drop.defuse();
-                host.connect_command_state.done();
+                host.connect_command_state().done();
                 Ok(conn)
             }
             Either::Second(_) => Err(Error::Timeout.into()),
@@ -144,7 +154,7 @@ impl<'stack, C: Controller, P: PacketPool> Central<'stack, C, P> {
             // can match new RPAs via the resolving list.
             #[cfg(feature = "security")]
             let addr = host
-                .connections
+                .connections()
                 .security_manager
                 .get_peer_bond_information(&(*entry).into())
                 .map(|bond| bond.identity.addr)

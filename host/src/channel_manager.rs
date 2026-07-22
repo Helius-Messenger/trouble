@@ -322,7 +322,7 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
         &'d self,
         index: ChannelIndex,
         config: &L2capChannelConfig,
-        ble: &BleHost<'d, T, P>,
+        ble: BleHost<'d, T, P>,
     ) -> Result<L2capChannel<'d, P>, BleHostError<T::Error>> {
         let L2capChannelConfig {
             mtu,
@@ -383,7 +383,7 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
         &self,
         index: ChannelIndex,
         result: LeCreditConnResultCode,
-        ble: &BleHost<'_, T, P>,
+        ble: BleHost<'_, T, P>,
     ) -> Result<(), BleHostError<T::Error>> {
         let (conn, req_id) = {
             let mut chan = self.channel_mut(index);
@@ -417,7 +417,7 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
         conn: ConnHandle,
         spsm: u16,
         config: &L2capChannelConfig,
-        ble: &BleHost<'_, T, P>,
+        ble: BleHost<'_, T, P>,
     ) -> Result<L2capChannel<'d, P>, BleHostError<T::Error>> {
         let L2capChannelConfig {
             mtu,
@@ -479,7 +479,7 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
         &'d self,
         conn: ConnHandle,
         idx: ChannelIndex,
-        ble: &BleHost<'_, T, P>,
+        ble: BleHost<'_, T, P>,
         cx: Option<&mut Context<'_>>,
     ) -> Poll<Result<L2capChannel<'d, P>, BleHostError<T::Error>>> {
         if let Some(cx) = cx {
@@ -487,7 +487,7 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
         }
         let mut storage = self.channel_mut(idx);
         // Check if we've been disconnected while waiting
-        if !ble.connections.is_handle_connected(conn) {
+        if !ble.connections().is_handle_connected(conn) {
             return Poll::Ready(Err(Error::Disconnected.into()));
         }
 
@@ -909,9 +909,9 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
     pub(crate) async fn receive_sdu<T: Controller>(
         &self,
         chan: ChannelIndex,
-        ble: &BleHost<'d, T, P>,
+        ble: BleHost<'_, T, P>,
     ) -> Result<Sdu<P::Packet>, BleHostError<T::Error>> {
-        let pdu = self.receive_pdu(&ble.connections, chan).await?;
+        let pdu = self.receive_pdu(ble.connections(), chan).await?;
         let mut p_buf: [u8; 16] = [0; 16];
         self.flow_control(chan, ble, &mut p_buf).await?;
         Ok(Sdu::from_pdu(pdu))
@@ -924,9 +924,9 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
         &self,
         chan: ChannelIndex,
         buf: &mut [u8],
-        ble: &BleHost<'d, T, P>,
+        ble: BleHost<'_, T, P>,
     ) -> Result<usize, BleHostError<T::Error>> {
-        let pdu = self.receive_pdu(&ble.connections, chan).await?;
+        let pdu = self.receive_pdu(ble.connections(), chan).await?;
 
         let to_copy = pdu.len().min(buf.len());
         // info!("[host] received a pdu of len {}, copying {} bytes", pdu.len(), to_copy);
@@ -968,7 +968,7 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
         index: ChannelIndex,
         buf: &[u8],
         p_buf: &mut [u8],
-        ble: &BleHost<'d, T, P>,
+        ble: BleHost<'_, T, P>,
     ) -> Result<(), BleHostError<T::Error>> {
         let (conn, mps, mtu, peer_cid) = self.connected_channel_params(index)?;
         if buf.len() > mtu as usize {
@@ -985,14 +985,14 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
         let (first, remaining) = buf.split_at(buf.len().min(mps as usize - 2));
 
         let len = encode(first, &mut p_buf[..], peer_cid, Some(buf.len() as u16))?;
-        ble.l2cap(conn, (len - 4) as u16, 1).await?.send(&p_buf[..len]).await?;
+        ble.l2cap_pdu(conn).await?.send(&p_buf[..len]).await?;
         grant.confirm(1);
 
         let chunks = remaining.chunks(mps as usize);
 
         for chunk in chunks {
             let len = encode(chunk, &mut p_buf[..], peer_cid, None)?;
-            ble.l2cap(conn, (len - 4) as u16, 1).await?.send(&p_buf[..len]).await?;
+            ble.l2cap_pdu(conn).await?.send(&p_buf[..len]).await?;
             grant.confirm(1);
         }
         Ok(())
@@ -1008,7 +1008,7 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
         index: ChannelIndex,
         buf: &[u8],
         p_buf: &mut [u8],
-        ble: &BleHost<'d, T, P>,
+        ble: BleHost<'_, T, P>,
     ) -> Result<(), BleHostError<T::Error>> {
         let (conn, mps, mtu, peer_cid) = self.connected_channel_params(index)?;
         if buf.len() > mtu as usize {
@@ -1016,7 +1016,8 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
         }
 
         // The number of packets we'll need to send for this payload
-        let len = (buf.len() as u16).saturating_add(2);
+        let sdu_len = buf.len() as u16;
+        let len = sdu_len.saturating_add(2);
         let n_packets = len.div_ceil(mps);
 
         let mut grant = match self.poll_request_to_send(index, n_packets, None) {
@@ -1027,7 +1028,7 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
         };
 
         // Pre-request
-        let mut sender = ble.try_l2cap(conn, len, n_packets)?;
+        let mut sender = ble.try_l2cap_sdu(conn, sdu_len, mps)?;
 
         // Segment using mps
         let (first, remaining) = buf.split_at(buf.len().min(mps as usize - 2));
@@ -1074,7 +1075,7 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
     pub(crate) async fn send_conn_param_update_req<T: Controller>(
         &self,
         handle: ConnHandle,
-        host: &BleHost<'d, T, P>,
+        host: &BleHost<'_, T, P>,
         param: &ConnParamUpdateReq,
     ) -> Result<(), BleHostError<T::Error>> {
         let identifier = self.next_request_id();
@@ -1085,7 +1086,7 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
     pub(crate) async fn send_conn_param_update_res<T: Controller>(
         &self,
         handle: ConnHandle,
-        host: &BleHost<'d, T, P>,
+        host: &BleHost<'_, T, P>,
         param: &ConnParamUpdateRes,
     ) -> Result<(), BleHostError<T::Error>> {
         let identifier = self.next_request_id();
@@ -1107,7 +1108,7 @@ impl<'d, P: PacketPool> ChannelManager<'d, P> {
     async fn flow_control<T: Controller>(
         &self,
         index: ChannelIndex,
-        ble: &BleHost<'d, T, P>,
+        ble: BleHost<'_, T, P>,
         p_buf: &mut [u8],
     ) -> Result<(), BleHostError<T::Error>> {
         let (conn, cid, credits) = {
@@ -1641,14 +1642,17 @@ mod tests {
 
     #[test]
     fn channel_refcount() {
-        let mut resources: HostResources<_, DefaultPacketPool, 2, 2> = HostResources::new();
+        let mut resources: HostResources<DefaultPacketPool, 2, 2> = HostResources::new();
         let ble = MockController::new();
 
-        let mut builder = crate::new(ble, &mut resources);
-        let ble = builder.host();
+        let builder = crate::new(ble, &mut resources);
+        let ble = BleHost::new(
+            builder.controller.as_ref().unwrap(),
+            builder.host_state.as_ref().unwrap(),
+        );
 
         let conn = ConnHandle::new(33);
-        ble.connections
+        ble.connections()
             .connect(
                 conn,
                 Address::new(AddrKind::PUBLIC, BdAddr::new([0; 6])),
@@ -1657,19 +1661,19 @@ mod tests {
             )
             .unwrap();
         let idx = ble
-            .channels
+            .channels()
             .alloc(conn, None, |storage| {
                 storage.state = ChannelState::Connecting(42);
             })
             .unwrap();
 
-        let chan = ble.channels.poll_created(conn, idx, ble, None);
+        let chan = ble.channels().poll_created(conn, idx, ble, None);
         assert!(matches!(chan, Poll::Pending));
 
-        ble.connections.disconnected(conn, Status::UNSPECIFIED).unwrap();
-        ble.channels.disconnected(conn).unwrap();
+        ble.connections().disconnected(conn, Status::UNSPECIFIED).unwrap();
+        ble.channels().disconnected(conn).unwrap();
 
-        let chan = ble.channels.poll_created(conn, idx, ble, None);
+        let chan = ble.channels().poll_created(conn, idx, ble, None);
         assert!(matches!(
             chan,
             Poll::Ready(Err(BleHostError::BleHost(Error::Disconnected)))

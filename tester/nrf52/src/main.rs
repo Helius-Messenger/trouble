@@ -15,8 +15,6 @@ use embedded_alloc::LlffHeap as Heap;
 use nrf_sdc::mpsl::MultiprotocolServiceLayer;
 use nrf_sdc::{self as sdc, mpsl};
 use panic_probe as _;
-use rand_chacha::ChaCha12Rng;
-use rand_core::SeedableRng;
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
 use trouble_tester_app::BtpConfig;
@@ -114,14 +112,18 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     let mut rng = rng::Rng::new(p.RNG, Irqs);
-    let chacha_rng = ChaCha12Rng::from_rng(&mut rng).unwrap();
+
+    // We use a random IRK because it only needs to remain stable during a single test case
+    let mut irk_bytes = [0u8; 16];
+    rng.blocking_fill_bytes(&mut irk_bytes);
+    let irk = IdentityResolvingKey::from_le_bytes(irk_bytes).unwrap();
 
     let mut sdc_mem = sdc::Mem::<10504>::new();
     let sdc = unwrap!(build_sdc(sdc_p, &mut rng, mpsl, &mut sdc_mem));
 
     let mut uart_config = embassy_nrf::uarte::Config::default();
-    uart_config.baudrate = buffered_uarte::Baudrate::BAUD115200;
-    uart_config.parity = buffered_uarte::Parity::EXCLUDED;
+    uart_config.baudrate = buffered_uarte::Baudrate::Baud115200;
+    uart_config.parity = buffered_uarte::Parity::Excluded;
     static RX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
     static TX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
     let rx_buf = RX_BUF.init([0u8; 512]);
@@ -162,7 +164,7 @@ async fn main(spawner: Spawner) -> ! {
             device_name: "TrouBLE-Tester",
             appearance: bt_hci::uuid::appearance::UNKNOWN,
         },
-        chacha_rng,
+        irk,
     )
     .await;
 

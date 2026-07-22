@@ -20,17 +20,17 @@ where
 
     info!("Our address = {:?}", address);
 
-    let mut resources: HostResources<_, DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> = HostResources::new();
+    let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> = HostResources::new();
     let stack = trouble_host::new(controller, &mut resources)
         .set_random_address(address)
         .build();
-    let central = stack.central();
+    let mut central = stack.central();
     let mut runner = stack.runner();
 
     let printer = Printer {
         seen: RefCell::new(Deque::new()),
     };
-    let mut scanner = Scanner::new(central);
+    let mut scanner = Scanner::new(&mut central);
     let _ = join(runner.run_with_handler(&printer), async {
         let mut config = ScanConfig::default();
         config.active = true;
