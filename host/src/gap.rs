@@ -30,13 +30,6 @@ pub const GAP_SERVICE_ATTRIBUTE_COUNT: usize = 6;
 /// The number of attributes added by the GAP and GATT services (with security)
 #[cfg(all(feature = "security", feature = "central"))]
 pub const GAP_SERVICE_ATTRIBUTE_COUNT: usize = 8;
-/// Security-enabled peripheral with no `central` role: `CENTRAL_ADDRESS_RESOLUTION`
-/// is only added in the `security && central` arm above, so a peripheral-only
-/// security build has the same 6 GAP attributes as a non-security build. Without
-/// this arm `GAP_SERVICE_ATTRIBUTE_COUNT` is undefined for `security && !central`
-/// and the `gatt_server` macro fails to compile (E0425).
-#[cfg(all(feature = "security", not(feature = "central")))]
-pub const GAP_SERVICE_ATTRIBUTE_COUNT: usize = 6;
 
 /// Configuration for the GAP Service.
 pub enum GapConfig<'a> {
