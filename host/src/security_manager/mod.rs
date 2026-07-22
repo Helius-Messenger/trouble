@@ -264,6 +264,19 @@ impl Inner {
             handle,
             peer_identity,
         } = *cmd;
+        // A PairingRequest always INITIATES a new pairing (BT Core, Vol 3 Part H
+        // §2.3 / §3.5.1). If a prior pairing on this connection was interrupted
+        // (central dropped or re-issued mid-handshake), the peripheral
+        // `pairing_sm` is left in a non-idle mid-pairing state (result() == None),
+        // so `is_idle()` is false and this fresh PairingRequest would be
+        // dispatched into that stale SM → the FSM catch-all → Error::InvalidState,
+        // and the peripheral could NEVER pair again until a matching disconnect
+        // reset it (HW-observed on the nRF52840 techo under connect churn: "Failed
+        // to handle security manager packet, InvalidState" → LMP Response
+        // Timeout). Drop the stale SM so a fresh peripheral SM is created below.
+        if command == Command::PairingRequest && !self.is_idle() {
+            self.pairing_sm = None;
+        }
         if self.is_idle() && command == Command::PairingRequest {
             let local_address = self.connection_local_address(storage)?;
             let peer_address = Self::connection_peer_address(storage);
