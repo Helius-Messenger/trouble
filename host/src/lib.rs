@@ -782,30 +782,6 @@ impl<'stack, C: Controller, P: PacketPool> StackBuilder<'stack, C, P> {
         self
     }
 
-    /// Distribute the given Identity Resolving Key (IRK) during bonding WITHOUT
-    /// enabling rotating-RPA address privacy.
-    ///
-    /// Unlike [`enable_privacy`](Self::enable_privacy), this keeps the fixed
-    /// advertising address configured via [`set_random_address`](Self::set_random_address)
-    /// (or the public address) — the controller does NOT generate rotating RPAs
-    /// and the resolving list is NOT touched. The IRK is still shared with the
-    /// peer during LE-Secure-Connections key distribution, so centrals that
-    /// require a complete bond (notably Android and iOS) accept the pairing
-    /// instead of aborting after "Link encrypted".
-    ///
-    /// This matches Meshtastic's BLE behavior (fixed device address + IRK
-    /// distribution) and is the right choice for a device that advertises a
-    /// stable, discoverable address. The IRK should be persisted across reboots
-    /// so a bonded central can continue to resolve it if it ever chooses to.
-    #[cfg(feature = "security")]
-    pub fn distribute_identity_key(mut self, irk: IdentityResolvingKey) -> Self {
-        self.host()
-            .connections
-            .security_manager
-            .distribute_identity_key(irk);
-        self
-    }
-
     /// Set the RPA (Resolvable Private Address) rotation timeout.
     ///
     /// New RPAs will be generated after this duration. Note that host generated RPAs
