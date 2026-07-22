@@ -949,9 +949,10 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
     ) -> Result<(), crate::BleHostError<C::Error>>
     where
         C: crate::ControllerCmdSync<bt_hci::cmd::le::LeLongTermKeyRequestReply>
+            + crate::ControllerCmdSync<bt_hci::cmd::le::LeLongTermKeyRequestNegativeReply>
             + crate::ControllerCmdAsync<bt_hci::cmd::le::LeEnableEncryption>,
     {
-        use bt_hci::cmd::le::{LeEnableEncryption, LeLongTermKeyRequestReply};
+        use bt_hci::cmd::le::{LeEnableEncryption, LeLongTermKeyRequestNegativeReply, LeLongTermKeyRequestReply};
 
         match _event {
             crate::security_manager::SecurityEventData::SendLongTermKey(handle, ediv, rand) => {
@@ -976,11 +977,23 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                             .await?;
                     } else {
                         warn!("[host] Long term key request reply failed, no long term key");
-                        // Send disconnect event to the controller
-                        self.request_handle_disconnect(handle, DisconnectReason::AuthenticationFailure);
+                        // We have an identity for this peer but no matching LTK (stale/lost
+                        // bond). Negative-reply so the controller fails LL encryption
+                        // immediately and the central re-pairs, instead of stalling to the
+                        // ~38 s LMP Response Timeout (HCI 0x22).
+                        let _ = host
+                            .command(LeLongTermKeyRequestNegativeReply::new(handle))
+                            .await?;
                     }
                 } else {
-                    warn!("[host] Long term key request reply failed, unknown peer")
+                    warn!("[host] Long term key request reply failed, unknown peer");
+                    // Unknown peer (no stored identity): the central reconnected believing
+                    // it is bonded, but we have no key. Negative-reply so the controller
+                    // does not silently wait for a reply that never comes (~38 s LMP
+                    // Response Timeout → HCI 0x22); the central then re-pairs.
+                    let _ = host
+                        .command(LeLongTermKeyRequestNegativeReply::new(handle))
+                        .await?;
                 }
             }
             crate::security_manager::SecurityEventData::EnableEncryption(handle, bond_info) => {
