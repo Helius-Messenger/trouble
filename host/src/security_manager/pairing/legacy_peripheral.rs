@@ -249,7 +249,7 @@ impl Pairing {
         ops: &mut OPS,
         rng: &mut RNG,
     ) -> Result<Self, Error> {
-        info!("[smp legacy peripheral] Link encrypted!");
+        debug!("[smp legacy peripheral] Link encrypted!");
         if matches!(previous, Self::WaitingPairingRequest) {
             pairing_data.bond_information = ops.try_enable_bonded_encryption()?;
         }
@@ -423,8 +423,8 @@ impl Pairing {
                 .initiator_key_distribution
                 .set_encryption_key();
         }
-        // Always agree to distribute identity key when the peer requests it
-        if peer_features.responder_key_distribution.identity_key() {
+        // Without a local IRK, decline identity key distribution instead of sending a zero IRK.
+        if peer_features.responder_key_distribution.identity_key() && ops.local_irk() != [0; 16] {
             pairing_data
                 .local_features
                 .responder_key_distribution
@@ -448,7 +448,7 @@ impl Pairing {
         }
         pairing_data.pairing_method =
             choose_legacy_pairing_method(pairing_data.peer_features, pairing_data.local_features);
-        info!("[smp legacy] Pairing method {:?}", pairing_data.pairing_method);
+        debug!("[smp legacy] Pairing method {:?}", pairing_data.pairing_method);
 
         // Send PairingResponse and store the command bytes for c1
         let mut packet = prepare_packet::<P>(Command::PairingResponse)?;

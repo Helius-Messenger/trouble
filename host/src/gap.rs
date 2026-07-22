@@ -8,8 +8,6 @@
 //! parameters accessible on the user interface level.
 
 use embassy_sync::blocking_mutex::raw::RawMutex;
-use heapless::String;
-use static_cell::StaticCell;
 
 use crate::prelude::*;
 
@@ -25,6 +23,9 @@ const DEVICE_NAME_MAX_LENGTH: usize = 22;
 ///                                 ---
 ///                                 = 6 (or 8 with security+central)
 #[cfg(not(feature = "security"))]
+pub const GAP_SERVICE_ATTRIBUTE_COUNT: usize = 6;
+/// The number of attributes added by the GAP and GATT services (with security, peripheral only)
+#[cfg(all(feature = "security", not(feature = "central")))]
 pub const GAP_SERVICE_ATTRIBUTE_COUNT: usize = 6;
 /// The number of attributes added by the GAP and GATT services (with security)
 #[cfg(all(feature = "security", feature = "central"))]
@@ -94,14 +95,14 @@ impl<'a> GapConfig<'a> {
 impl<'a> PeripheralConfig<'a> {
     /// Add the peripheral GAP config to the attribute table
     fn build<M: RawMutex, const MAX: usize>(self, table: &mut AttributeTable<'a, M, MAX>) -> Result<(), &'static str> {
-        static PERIPHERAL_NAME: StaticCell<String<DEVICE_NAME_MAX_LENGTH>> = StaticCell::new();
-        let peripheral_name = PERIPHERAL_NAME.init(String::new());
-        peripheral_name
-            .push_str(self.name)
-            .map_err(|_| "Device name is too long. Max length is 22 bytes")?;
+        // Store the name by reference (lives for `'a`); a one-shot StaticCell
+        // would panic if the server is ever built twice.
+        if self.name.len() > DEVICE_NAME_MAX_LENGTH {
+            return Err("Device name is too long. Max length is 22 bytes");
+        }
 
         let mut gap_builder = table.add_service(Service::new(service::GAP));
-        gap_builder.add_characteristic_ro(characteristic::DEVICE_NAME, peripheral_name);
+        gap_builder.add_characteristic_ro(characteristic::DEVICE_NAME, self.name);
         gap_builder.add_characteristic_ro(characteristic::APPEARANCE, self.appearance);
         #[cfg(all(feature = "security", feature = "central"))]
         gap_builder.add_characteristic_ro(characteristic::CENTRAL_ADDRESS_RESOLUTION, &1u8);
@@ -116,14 +117,14 @@ impl<'a> PeripheralConfig<'a> {
 impl<'a> CentralConfig<'a> {
     /// Add the peripheral GAP config to the attribute table
     fn build<M: RawMutex, const MAX: usize>(self, table: &mut AttributeTable<'a, M, MAX>) -> Result<(), &'static str> {
-        static CENTRAL_NAME: StaticCell<String<DEVICE_NAME_MAX_LENGTH>> = StaticCell::new();
-        let central_name = CENTRAL_NAME.init(String::new());
-        central_name
-            .push_str(self.name)
-            .map_err(|_| "Device name is too long. Max length is 22 bytes")?;
+        // Store the name by reference (lives for `'a`); a one-shot StaticCell
+        // would panic if the server is ever built twice.
+        if self.name.len() > DEVICE_NAME_MAX_LENGTH {
+            return Err("Device name is too long. Max length is 22 bytes");
+        }
 
         let mut gap_builder = table.add_service(Service::new(service::GAP));
-        gap_builder.add_characteristic_ro(characteristic::DEVICE_NAME, central_name);
+        gap_builder.add_characteristic_ro(characteristic::DEVICE_NAME, self.name);
         gap_builder.add_characteristic_ro(characteristic::APPEARANCE, self.appearance);
         #[cfg(all(feature = "security", feature = "central"))]
         gap_builder.add_characteristic_ro(characteristic::CENTRAL_ADDRESS_RESOLUTION, &1u8);
@@ -132,5 +133,29 @@ impl<'a> CentralConfig<'a> {
         table.add_service(Service::new(service::GATT));
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+
+    use super::*;
+
+    // Building the GAP config twice must not panic. With the one-shot StaticCell
+    // the second build panicked ("StaticCell already full").
+    #[test]
+    fn gap_config_can_be_built_twice() {
+        for _ in 0..2 {
+            let mut table: AttributeTable<'_, NoopRawMutex, 16> = AttributeTable::new();
+            GapConfig::Peripheral(PeripheralConfig {
+                name: "trouble",
+                appearance: &appearance::UNKNOWN,
+            })
+            .build(&mut table)
+            .unwrap();
+        }
     }
 }

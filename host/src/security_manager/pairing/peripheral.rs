@@ -283,7 +283,7 @@ impl Pairing {
         let secret_key = ops.secret_key().clone();
         let local_public_key = *ops.public_key();
         let dh_key = secret_key
-            .dh_key(peer_public_key)
+            .dh_key(peer_public_key, &local_public_key)
             .ok_or(Error::Security(Reason::DHKeyCheckFailed))?;
 
         Self::send_public_key(ops, &local_public_key)?;
@@ -365,7 +365,7 @@ impl Pairing {
         ops: &mut OPS,
     ) -> Result<Self, Error> {
         if res {
-            info!("Link encrypted!");
+            debug!("Link encrypted!");
             if matches!(current, Self::WaitingPairingRequest) {
                 pairing_data.bond_information = ops.try_enable_bonded_encryption()?;
             }
@@ -498,15 +498,8 @@ impl Pairing {
                 .set_identity_key();
         }
 
-        // Only agree to distribute our identity key (IRK) when we ACTUALLY have a
-        // non-zero IRK. Upstream always agreed and then sent a zero IRK + our
-        // identity address; macOS/iOS reject that with PairingFailed("unspecified
-        // reason"), aborting the bond right after `Link encrypted!`. A
-        // fixed-address peripheral (no rotating RPA) has no IRK to share, so we
-        // decline — bonding still completes with the LE-Secure-Connections LTK,
-        // and the central simply can't resolve an RPA we never use. (Helius
-        // FW-BLE-SEC-1 fix; the central's own identity key is still accepted below.)
-        if peer_features.responder_key_distribution.identity_key() && ops.local_irk() != [0u8; 16] {
+        // Without a local IRK, decline identity key distribution instead of sending a zero IRK.
+        if peer_features.responder_key_distribution.identity_key() && ops.local_irk() != [0; 16] {
             pairing_data
                 .local_features
                 .responder_key_distribution
@@ -523,7 +516,7 @@ impl Pairing {
             pairing_data.local_features.use_oob = crate::security_manager::types::UseOutOfBand::Present;
         }
         pairing_data.pairing_method = choose_pairing_method(pairing_data.peer_features, pairing_data.local_features);
-        info!("[smp] Pairing method {:?}", pairing_data.pairing_method);
+        debug!("[smp] Pairing method {:?}", pairing_data.pairing_method);
         Ok(())
     }
 
@@ -661,10 +654,10 @@ impl Pairing {
         );
 
         if pairing_data.pairing_method == PairingMethod::JustWorks {
-            info!("[smp] Just works pairing with compare {}", vb.0);
+            debug!("[smp] Just works pairing with compare {}", vb.0);
             Ok(Self::WaitingDHKeyEa(phase_data))
         } else {
-            info!("[smp] Numeric comparison pairing with compare {}", vb.0);
+            debug!("[smp] Numeric comparison pairing with compare {}", vb.0);
             ops.try_send_connection_event(ConnectionEvent::PassKeyConfirm(PassKey(vb.0)))?;
             Ok(Self::WaitingNumericComparisonResult { phase_data, ea: None })
         }

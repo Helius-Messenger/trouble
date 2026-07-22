@@ -35,6 +35,15 @@ impl LongTermKey {
     pub const fn to_le_bytes(self) -> [u8; 16] {
         self.0.to_le_bytes()
     }
+
+    /// Derives a Long Term Key from a 128-bit Encryption Root (ER) and 16-bit
+    /// Diversifier (DIV) ([Vol 3] Part H, Section B.2.2).
+    ///
+    ///   LTK = d1(ER, DIV, 0)
+    #[inline]
+    pub fn from_encryption_root(er: u128, div: u16) -> Self {
+        Self(d1(er, div, 0))
+    }
 }
 
 impl From<&LongTermKey> for u128 {
@@ -78,6 +87,15 @@ impl IdentityResolvingKey {
     #[inline(always)]
     pub const fn from_le_bytes(k: [u8; 16]) -> Option<Self> {
         Self::new(u128::from_le_bytes(k))
+    }
+
+    /// Derives an Identity Resolving Key from a 128-bit Identity Root (IR)
+    /// ([Vol 3] Part H, Section B.2.3).
+    ///
+    ///   IRK = d1(IR, 1, 0)
+    #[inline]
+    pub fn from_identity_root(ir: u128) -> Option<Self> {
+        Self::new(d1(ir, 1, 0))
     }
 
     /// Returns the Identity Resolving Key as `[u8; 16]` value in little endian.
@@ -353,7 +371,7 @@ pub struct NumCompare(pub u32);
 #[derive(Clone)]
 #[must_use]
 #[repr(transparent)]
-pub struct SecretKey(p256_cortex_m4::SecretKey);
+pub struct SecretKey(p256::NonZeroScalar);
 
 impl core::fmt::Debug for SecretKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -373,47 +391,48 @@ impl SecretKey {
     #[allow(clippy::new_without_default)]
     #[inline(always)]
     pub fn new<T: RngCore + CryptoRng>(rng: &mut T) -> Self {
-        Self(p256_cortex_m4::SecretKey::random(&mut *rng))
+        Self(p256::NonZeroScalar::random(rng))
     }
 
     /// Computes the associated public key.
     pub fn public_key(&self) -> PublicKey {
-        // Uncompressed SEC1 without the 0x04 tag = x-coord ‖ y-coord, both 32B big-endian.
-        let ut = self.0.public_key().to_untagged_bytes();
-        let mut x = [0u8; 32];
-        let mut y = [0u8; 32];
-        x.copy_from_slice(&ut[..32]);
-        y.copy_from_slice(&ut[32..]);
-        PublicKey {
-            x: PublicKeyX(Coord(x)),
-            y: Coord(y),
+        use p256::elliptic_curve::sec1::Coordinates::Uncompressed;
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        let p = p256::PublicKey::from_secret_scalar(&self.0).to_encoded_point(false);
+        match p.coordinates() {
+            Uncompressed { x, y } => PublicKey {
+                x: PublicKeyX(Coord(*x.as_ref())),
+                y: Coord(*y.as_ref()),
+            },
+            _ => unreachable!("invalid secret key"),
         }
     }
 
     /// Computes a shared secret from the local secret key and remote public
     /// key. Returns [`None`] if the public key is either invalid or derived
     /// from the same secret key ([Vol 3] Part H, Section 2.3.5.6.1).
+    ///
+    /// `local_pk` must be the public key of `self`; passing it in avoids an
+    /// expensive scalar multiplication to recompute it.
     #[must_use]
-    pub fn dh_key(&self, pk: PublicKey) -> Option<DHKey> {
+    pub fn dh_key(&self, pk: PublicKey, local_pk: &PublicKey) -> Option<DHKey> {
+        use p256::elliptic_curve::sec1::FromEncodedPoint;
         if pk.is_debug() {
             return None; // TODO: Compile-time option for debug-only mode
         }
-        // Rebuild the peer public key from its x‖y coordinates (untagged SEC1).
-        let mut ut = [0u8; 64];
-        ut[..32].copy_from_slice(&pk.x.0 .0);
-        ut[32..].copy_from_slice(&pk.y.0);
-        let peer = p256_cortex_m4::PublicKey::from_untagged_bytes(&ut).ok()?;
-        // Reject a peer key equal to our own ([Vol 3] Part H, 2.3.5.6.1).
-        let ours = self.0.public_key().to_untagged_bytes();
-        if peer.to_untagged_bytes() == ours {
-            return None;
+
+        let (x, y) = (&pk.x.0 .0.into(), &pk.y.0.into());
+        let rep = p256::EncodedPoint::from_affine_coordinates(x, y, false);
+        let (lx, ly) = (&local_pk.x.0 .0.into(), &local_pk.y.0.into());
+        let lrep = p256::EncodedPoint::from_affine_coordinates(lx, ly, false);
+        let lpk: Option<p256::PublicKey> = Option::from(p256::PublicKey::from_encoded_point(&lrep));
+        // Constant-time ops not required:
+        // https://github.com/RustCrypto/traits/issues/1227
+        let rpk: Option<p256::PublicKey> = Option::from(p256::PublicKey::from_encoded_point(&rep));
+        match (rpk, lpk) {
+            (Some(rpk), Some(lpk)) if rpk != lpk => Some(DHKey(ecdh::diffie_hellman(&self.0, rpk.as_affine()))),
+            _ => None,
         }
-        let ss = self.0.agree(&peer);
-        // Wrap the ECDH x-coordinate back into the RustCrypto SharedSecret type
-        // that the f5/f6 key-derivation downstream expects (byte-identical).
-        let mut fb = p256::FieldBytes::default();
-        fb.copy_from_slice(ss.as_bytes());
-        Some(DHKey(ecdh::SharedSecret::from(fb)))
     }
 }
 
@@ -630,6 +649,22 @@ pub(super) fn s1(k: u128, r1: u128, r2: u128) -> u128 {
     u128::from_be_bytes(r_prime)
 }
 
+/// Diversifying function `d1` ([Vol 3] Part H, Section B.2.1).
+///
+///   d1(k, d, r) = e(k, d')
+/// where d' = padding(96) || r || d, with the least significant octet of `d`
+/// becoming the least significant octet of `d'`.
+pub(super) fn d1(k: u128, d: u16, r: u16) -> u128 {
+    let mut d_prime = [0u8; 16];
+    d_prime[12..14].copy_from_slice(&r.to_be_bytes());
+    d_prime[14..16].copy_from_slice(&d.to_be_bytes());
+
+    let cipher = Aes128::new_from_slice(&k.to_be_bytes()).unwrap();
+    cipher.encrypt_block((&mut d_prime).into());
+
+    u128::from_be_bytes(d_prime)
+}
+
 /// Combines `hi` and `lo` values into a big-endian byte array.
 #[allow(clippy::redundant_pub_crate)]
 #[cfg(test)]
@@ -721,12 +756,12 @@ mod tests {
         assert_eq!(ska.public_key(), pka);
         assert_eq!(skb.public_key(), pkb);
         assert_eq!(
-            ska.dh_key(pkb).unwrap().0.raw_secret_bytes(),
+            ska.dh_key(pkb, &pka).unwrap().0.raw_secret_bytes(),
             dh_key.0.raw_secret_bytes()
         );
 
         assert!(!pkb.is_debug());
-        assert!(skb.dh_key(pkb).is_none());
+        assert!(skb.dh_key(pkb, &pkb).is_none());
     }
 
     /// P-256 data set 2 ([Vol 2] Part G, Section 7.1.2.2).
@@ -771,7 +806,7 @@ mod tests {
         assert_eq!(ska.public_key(), pka);
         assert_eq!(skb.public_key(), pkb);
         assert_eq!(
-            ska.dh_key(pkb).unwrap().0.raw_secret_bytes(),
+            ska.dh_key(pkb, &pka).unwrap().0.raw_secret_bytes(),
             dh_key.0.raw_secret_bytes()
         );
     }
@@ -794,7 +829,7 @@ mod tests {
 
     #[inline]
     fn secret_key(hi: u128, lo: u128) -> SecretKey {
-        SecretKey(p256_cortex_m4::SecretKey::from_bytes(u256::<p256::FieldBytes>(hi, lo)).unwrap())
+        SecretKey(p256::NonZeroScalar::from_repr(u256(hi, lo)).unwrap())
     }
 
     #[inline]
@@ -805,12 +840,12 @@ mod tests {
     #[test]
     fn testtest() {
         let skb = SecretKey::new(&mut OsRng::default());
-        let _pkb = skb.public_key();
+        let pkb = skb.public_key();
 
         let ska = SecretKey::new(&mut OsRng::default());
         let pka = ska.public_key();
 
-        let _dh_key = skb.dh_key(pka).unwrap();
+        let _dh_key = skb.dh_key(pka, &pkb).unwrap();
     }
 
     #[test]
@@ -823,11 +858,11 @@ mod tests {
         ];
 
         let skb = SecretKey::new(&mut OsRng::default());
-        let _pkb = skb.public_key();
+        let pkb = skb.public_key();
 
         let pka = PublicKey::from_bytes(&bytes);
 
-        let _dh_key = skb.dh_key(pka).unwrap();
+        let _dh_key = skb.dh_key(pka, &pkb).unwrap();
     }
 
     #[test]
@@ -971,5 +1006,16 @@ mod tests {
 
         let result = s1(k, r1, r2);
         assert_eq!(result, 0x9a1fe1f0e8b0f49b5b4216ae796da062);
+    }
+
+    /// Diversifying function d1 ([Vol 3] Part H, Section B.2.1).
+    /// Spec example: d=0x1234, r=0xABCD => d' = 0x000000000000000000000000ABCD1234.
+    #[allow(clippy::unreadable_literal)]
+    #[test]
+    fn diversify_d1() {
+        let k: u128 = 0x000102030405060708090a0b0c0d0e0f;
+        let d: u16 = 0x1234;
+        let r: u16 = 0xABCD;
+        assert_eq!(d1(k, d, r), 0xb66854fa3dd35aadf83a6c59e22b52fd);
     }
 }

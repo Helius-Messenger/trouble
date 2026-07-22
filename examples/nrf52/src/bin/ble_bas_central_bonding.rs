@@ -9,8 +9,6 @@ use embassy_nrf::qspi;
 use embassy_nrf::{bind_interrupts, rng};
 use nrf_sdc::mpsl::MultiprotocolServiceLayer;
 use nrf_sdc::{self as sdc, mpsl};
-use rand_chacha::ChaCha12Rng;
-use rand_core::SeedableRng;
 use static_cell::StaticCell;
 use trouble_example_apps::ble_bas_central_bonding;
 use {defmt_rtt as _, panic_probe as _};
@@ -74,16 +72,15 @@ async fn main(spawner: Spawner) {
     );
 
     let mut rng = rng::Rng::new(p.RNG, Irqs);
-    let mut rng_2 = ChaCha12Rng::from_rng(&mut rng).unwrap();
 
-    let mut sdc_mem = sdc::Mem::<6544>::new();
+    let mut sdc_mem = sdc::Mem::<7056>::new();
     let sdc = unwrap!(build_sdc(sdc_p, &mut rng, mpsl, &mut sdc_mem));
 
     // Config for the MX25R64 present in the nRF52840 DK
     let mut config = qspi::Config::default();
-    config.read_opcode = qspi::ReadOpcode::READ4IO;
-    config.write_opcode = qspi::WriteOpcode::PP4IO;
-    config.write_page_size = qspi::WritePageSize::_256BYTES;
+    config.read_opcode = qspi::ReadOpcode::Read4io;
+    config.write_opcode = qspi::WriteOpcode::Pp4io;
+    config.write_page_size = qspi::WritePageSize::_256bytes;
     config.frequency = qspi::Frequency::M32;
     config.capacity = 8*1024*1024;
 
@@ -100,5 +97,5 @@ async fn main(spawner: Spawner) {
 
     // MX25R64 has 4KB erase sectors
     let storage_range = 0..(4096u32 * 2);
-    ble_bas_central_bonding::run(sdc, &mut rng_2, &mut qspi, storage_range).await;
+    ble_bas_central_bonding::run(sdc, &mut qspi, storage_range).await;
 }

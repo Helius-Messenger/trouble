@@ -6,14 +6,13 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 trouble-host = { path = "../../host", features = ["derive", "scan"] }
-bt-hci = "0.8"
+bt-hci = "0.9"
 embassy-futures = "0.1.1"
 embassy-sync = { version = "0.8" }
 embassy-time = "0.5"
 embedded-hal-async = "1.0"
 static_cell = "2"
 heapless = "0.9"
-rand_core = { version = "0.6", default-features = false }
 
 # Used by 'security' feature
 embedded-storage-async = { version = "0.4.1", optional = true }
@@ -23,6 +22,7 @@ defmt = { version = "1.0.1", optional = true }
 log = { version = "0.4", optional = true }
 serde = { version = "1.0.228", default-features = false, features = ["derive"], optional = true }
 
+fixed = "=1.30.0"
 
 [features]
 defmt = [

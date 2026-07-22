@@ -36,6 +36,8 @@ use crate::BondInformation;
 use crate::{config, BleHostError, Error, PacketPool, Stack, MAX_INVALID_DATA_LEN};
 
 /// A GATT connection event.
+#[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum GattConnectionEvent<'stack, 'server, P: PacketPool> {
     /// Connection disconnected.
     Disconnected {
@@ -132,6 +134,8 @@ pub enum GattConnectionEvent<'stack, 'server, P: PacketPool> {
     Encrypted {
         /// Security level achieved by the encryption.
         security_level: SecurityLevel,
+        /// Bond information if encryption was achieved using a stored bond.
+        bond: Option<BondInformation>,
     },
     #[cfg(feature = "security")]
     /// OOB data is requested during pairing. Respond with [`GattConnection::provide_oob_data()`].
@@ -265,7 +269,9 @@ impl<'stack, 'server, P: PacketPool> GattConnection<'stack, 'server, P> {
                 ConnectionEvent::BondLost => GattConnectionEvent::BondLost,
 
                 #[cfg(feature = "security")]
-                ConnectionEvent::Encrypted { security_level } => GattConnectionEvent::Encrypted { security_level },
+                ConnectionEvent::Encrypted { security_level, bond } => {
+                    GattConnectionEvent::Encrypted { security_level, bond }
+                }
 
                 #[cfg(feature = "security")]
                 ConnectionEvent::OobRequest => GattConnectionEvent::OobRequest,
@@ -309,6 +315,19 @@ impl<'stack, 'server, P: PacketPool> GattConnection<'stack, 'server, P> {
 pub struct GattData<'stack, P: PacketPool> {
     pdu: Option<Pdu<P::Packet>>,
     connection: Connection<'stack, P>,
+}
+
+impl<P: PacketPool> core::fmt::Debug for GattData<'_, P> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("GattData").field(&self.pdu).finish()
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl<P: PacketPool> defmt::Format for GattData<'_, P> {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "GattData({})", &self.pdu)
+    }
 }
 
 impl<'stack, P: PacketPool> GattData<'stack, P> {
@@ -361,6 +380,8 @@ impl<'stack, P: PacketPool> GattData<'stack, P> {
 }
 
 /// An event returned while processing GATT requests.
+#[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum GattEvent<'stack, 'server, P: PacketPool> {
     /// A characteristic was read.
     Read(ReadEvent<'stack, 'server, P>),
@@ -465,6 +486,19 @@ pub struct ReadEvent<'stack, 'server, P: PacketPool> {
     server: &'server dyn DynamicAttributeServer<P>,
 }
 
+impl<P: PacketPool> core::fmt::Debug for ReadEvent<'_, '_, P> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("ReadEvent").field(&self.data).finish()
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl<P: PacketPool> defmt::Format for ReadEvent<'_, '_, P> {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "ReadEvent({})", &self.data)
+    }
+}
+
 impl<'stack, P: PacketPool> ReadEvent<'stack, '_, P> {
     /// Characteristic handle that was read
     pub fn handle(&self) -> u16 {
@@ -544,6 +578,19 @@ impl<P: PacketPool> Drop for ReadEvent<'_, '_, P> {
 pub struct WriteEvent<'stack, 'server, P: PacketPool> {
     data: GattData<'stack, P>,
     server: &'server dyn DynamicAttributeServer<P>,
+}
+
+impl<P: PacketPool> core::fmt::Debug for WriteEvent<'_, '_, P> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("WriteEvent").field(&self.data).finish()
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl<P: PacketPool> defmt::Format for WriteEvent<'_, '_, P> {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "WriteEvent({})", &self.data)
+    }
 }
 
 impl<'stack, P: PacketPool> WriteEvent<'stack, '_, P> {
@@ -670,6 +717,19 @@ pub struct OtherEvent<'stack, 'server, P: PacketPool> {
     server: &'server dyn DynamicAttributeServer<P>,
 }
 
+impl<P: PacketPool> core::fmt::Debug for OtherEvent<'_, '_, P> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("OtherEvent").field(&self.data).finish()
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl<P: PacketPool> defmt::Format for OtherEvent<'_, '_, P> {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "OtherEvent({})", &self.data)
+    }
+}
+
 impl<'stack, P: PacketPool> OtherEvent<'stack, '_, P> {
     /// Accept the event, making it processed by the server.
     ///
@@ -713,6 +773,19 @@ pub struct NotAllowedEvent<'stack, 'server, P: PacketPool> {
     data: GattData<'stack, P>,
     err: AttErrorCode,
     server: &'server dyn DynamicAttributeServer<P>,
+}
+
+impl<P: PacketPool> core::fmt::Debug for NotAllowedEvent<'_, '_, P> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("NotAllowedEvent").field(&self.data).finish()
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl<P: PacketPool> defmt::Format for NotAllowedEvent<'_, '_, P> {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "NotAllowedEvent({})", &self.data)
+    }
 }
 
 impl<'stack, P: PacketPool> NotAllowedEvent<'stack, '_, P> {
@@ -937,7 +1010,7 @@ const MAX_NOTIF: usize = config::GATT_CLIENT_NOTIFICATION_MAX_SUBSCRIBERS;
 const NOTIF_QSIZE: usize = config::GATT_CLIENT_NOTIFICATION_QUEUE_SIZE;
 
 /// BT Core Spec Vol 3, Part F, Section 3.3.3: ATT transaction timeout.
-const ATT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const ATT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A GATT client capable of using the GATT protocol.
 pub struct GattClient<'reference, T: Controller, P: PacketPool, const MAX_SERVICES: usize> {
@@ -1067,35 +1140,37 @@ impl<'reference, C: Controller, P: PacketPool, const MAX_SERVICES: usize> GattCl
         _stack: &Stack<'_, C, P>,
         connection: &Connection<'reference, P>,
     ) -> Result<GattClient<'reference, C, P, MAX_SERVICES>, BleHostError<C::Error>> {
-        let l2cap = L2capHeader { channel: 4, length: 3 };
-        let mut buf = P::allocate().ok_or(Error::OutOfMemory)?;
-        let mut w = WriteCursor::new(buf.as_mut());
-        w.write_hci(&l2cap)?;
-        w.write(att::Att::Client(att::AttClient::Request(att::AttReq::ExchangeMtu {
-            mtu: P::MTU as u16 - 4,
-        })))?;
+        if !connection.is_att_mtu_exchanged() {
+            let l2cap = L2capHeader { channel: 4, length: 3 };
+            let mut buf = P::allocate().ok_or(Error::OutOfMemory)?;
+            let mut w = WriteCursor::new(buf.as_mut());
+            w.write_hci(&l2cap)?;
+            w.write(att::Att::Client(att::AttClient::Request(att::AttReq::ExchangeMtu {
+                mtu: P::MTU as u16 - 4,
+            })))?;
 
-        let len = w.len();
-        connection.send(Pdu::new(buf, len)).await;
+            let len = w.len();
+            connection.send(Pdu::new(buf, len)).await;
 
-        // Await MTU exchange completion (BT Core Spec requires sequential ATT requests)
-        with_timeout(ATT_TRANSACTION_TIMEOUT, async {
-            loop {
-                let pdu = connection.next_gatt_client().await.ok_or(Error::Disconnected)?;
-                match pdu.as_ref()[0] {
-                    att::ATT_EXCHANGE_MTU_RSP | att::ATT_ERROR_RSP => break Ok::<_, BleHostError<C::Error>>(()),
-                    _ => {
-                        warn!("[gatt] unexpected PDU during MTU exchange, discarding");
+            // Await MTU exchange completion (BT Core Spec requires sequential ATT requests)
+            with_timeout(ATT_TRANSACTION_TIMEOUT, async {
+                loop {
+                    let pdu = connection.next_gatt_client().await.ok_or(Error::Disconnected)?;
+                    match pdu.as_ref()[0] {
+                        att::ATT_EXCHANGE_MTU_RSP | att::ATT_ERROR_RSP => break Ok::<_, BleHostError<C::Error>>(()),
+                        _ => {
+                            warn!("[gatt] unexpected PDU during MTU exchange, discarding");
+                        }
                     }
                 }
-            }
-        })
-        .await
-        .map_err(|_| {
-            warn!("[gatt] MTU exchange timeout (30s), disconnecting");
-            connection.disconnect();
-            BleHostError::BleHost(Error::Timeout)
-        })??;
+            })
+            .await
+            .map_err(|_| {
+                warn!("[gatt] MTU exchange timeout (30s), disconnecting");
+                connection.disconnect();
+                BleHostError::BleHost(Error::Timeout)
+            })??;
+        }
 
         // Enable encryption with bonded peers before starting GATT operations
         // (BT Core Spec Vol 3, Part C, Section 10.3.2: client "should" enable encryption on reconnection)

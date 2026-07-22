@@ -17,8 +17,6 @@ use bt_hci::FromHciBytesError;
 use embassy_time::Duration;
 #[cfg(feature = "security")]
 use heapless::{Vec, VecView};
-#[cfg(feature = "security")]
-use rand_core::{CryptoRng, RngCore};
 
 use crate::att::AttErrorCode;
 use crate::channel_manager::ChannelStorage;
@@ -44,6 +42,8 @@ mod command;
 pub mod config;
 mod connection_manager;
 mod cursor;
+#[cfg(feature = "iso")]
+pub mod iso;
 #[cfg(feature = "default-packet-pool")]
 mod packet_pool;
 mod pdu;
@@ -99,6 +99,8 @@ pub mod prelude {
     #[cfg(feature = "gatt")]
     pub use crate::gatt::*;
     pub use crate::host::{ControlRunner, EventHandler, HostMetrics, Runner, RxRunner, TxRunner};
+    #[cfg(feature = "iso")]
+    pub use crate::iso::Iso;
     pub use crate::l2cap::*;
     #[cfg(feature = "default-packet-pool")]
     pub use crate::packet_pool::DefaultPacketPool;
@@ -478,6 +480,7 @@ pub trait SecurityCmds:
     + ControllerCmdSync<LeSetAddrResolutionEnable>
     + ControllerCmdSync<LeSetResolvablePrivateAddrTimeout>
     + ControllerCmdSync<LeSetPrivacyMode>
+    + ControllerCmdSync<LeRand>
 {
 }
 
@@ -492,7 +495,8 @@ impl<
             + ControllerCmdSync<LeClearResolvingList>
             + ControllerCmdSync<LeSetAddrResolutionEnable>
             + ControllerCmdSync<LeSetResolvablePrivateAddrTimeout>
-            + ControllerCmdSync<LeSetPrivacyMode>,
+            + ControllerCmdSync<LeSetPrivacyMode>
+            + ControllerCmdSync<LeRand>,
     > SecurityCmds for C
 {
 }
@@ -608,14 +612,13 @@ pub trait PacketPool: 'static {
 /// The l2cap packet pool is used by the host to handle inbound data, by allocating space for
 /// incoming packets and dispatching to the appropriate connection and channel.
 pub struct HostResources<
-    C: Controller,
     P: PacketPool,
     const CONNS: usize,
     const CHANNELS: usize,
     const ADV_SETS: usize = 1,
     const BONDS: usize = 10,
 > {
-    host: MaybeUninit<ManuallyDrop<BleHost<'static, C, P>>>,
+    state: MaybeUninit<ManuallyDrop<host::HostState<'static, P>>>,
     connections: MaybeUninit<RefCell<[ConnectionStorage<P::Packet>; CONNS]>>,
     channels: MaybeUninit<RefCell<[ChannelStorage<P::Packet>; CHANNELS]>>,
     advertise_handles: MaybeUninit<RefCell<[AdvHandleState; ADV_SETS]>>,
@@ -623,33 +626,21 @@ pub struct HostResources<
     bond_storage: MaybeUninit<RefCell<Vec<BondInformation, BONDS>>>,
 }
 
-impl<
-        C: Controller,
-        P: PacketPool,
-        const CONNS: usize,
-        const CHANNELS: usize,
-        const ADV_SETS: usize,
-        const BONDS: usize,
-    > Default for HostResources<C, P, CONNS, CHANNELS, ADV_SETS, BONDS>
+impl<P: PacketPool, const CONNS: usize, const CHANNELS: usize, const ADV_SETS: usize, const BONDS: usize> Default
+    for HostResources<P, CONNS, CHANNELS, ADV_SETS, BONDS>
 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<
-        C: Controller,
-        P: PacketPool,
-        const CONNS: usize,
-        const CHANNELS: usize,
-        const ADV_SETS: usize,
-        const BONDS: usize,
-    > HostResources<C, P, CONNS, CHANNELS, ADV_SETS, BONDS>
+impl<P: PacketPool, const CONNS: usize, const CHANNELS: usize, const ADV_SETS: usize, const BONDS: usize>
+    HostResources<P, CONNS, CHANNELS, ADV_SETS, BONDS>
 {
     /// Create a new instance of host resources.
     pub const fn new() -> Self {
         Self {
-            host: MaybeUninit::uninit(),
+            state: MaybeUninit::uninit(),
             connections: MaybeUninit::uninit(),
             channels: MaybeUninit::uninit(),
             advertise_handles: MaybeUninit::uninit(),
@@ -671,7 +662,7 @@ pub fn new<
     const BONDS: usize,
 >(
     controller: C,
-    resources: &'resources mut HostResources<C, P, CONNS, CHANNELS, ADV_SETS, BONDS>,
+    resources: &'resources mut HostResources<P, CONNS, CHANNELS, ADV_SETS, BONDS>,
 ) -> StackBuilder<'resources, C, P> {
     let connections: &'resources RefCell<[ConnectionStorage<P::Packet>]> = resources
         .connections
@@ -690,30 +681,34 @@ pub fn new<
         resources.bond_storage.write(RefCell::new(Vec::new()));
 
     // SAFETY: Narrows the host field's lifetime from `'static` to `'resources`. Sound because:
-    // - BleHost is covariant in 'd so the types differ only in a lifetime (identical layout).
+    // - HostState is covariant in 'd so the types differ only in a lifetime (identical layout).
     // - The returned StackBuilder/Stack exclusively borrows the HostResources for 'resources,
     //   preventing re-entry into this function while the narrowed-lifetime data is live.
-    // - The host field is private, MaybeUninit (no auto-drop), and only ever accessed by this
+    // - The `state` field is private, MaybeUninit (no auto-drop), and only ever accessed by this
     //   function (which overwrites via write()), so the narrowed lifetime can never be observed
-    //   through the original `'static` type — even if the StackBuilder/Stack is mem::forget'd.
-    let host: &'resources mut MaybeUninit<ManuallyDrop<BleHost<'resources, C, P>>> =
-        unsafe { core::mem::transmute(&mut resources.host) };
+    //   through the original `'static` type — even if the StackBuilder/Stack is forgotten.
+    let host_state: &'resources mut MaybeUninit<ManuallyDrop<host::HostState<'resources, P>>> =
+        unsafe { core::mem::transmute(&mut resources.state) };
 
-    let host: &'resources mut ManuallyDrop<BleHost<'resources, C, P>> = host.write(ManuallyDrop::new(BleHost::new(
-        controller,
-        connections,
-        channels,
-        advertise_handles,
-        #[cfg(feature = "security")]
-        bond_storage,
-    )));
+    let host_state: &'resources mut ManuallyDrop<host::HostState<'resources, P>> =
+        host_state.write(ManuallyDrop::new(host::HostState::new(
+            connections,
+            channels,
+            advertise_handles,
+            #[cfg(feature = "security")]
+            bond_storage,
+        )));
 
-    StackBuilder { host: Some(host) }
+    StackBuilder {
+        host_state: Some(host_state),
+        controller: Some(controller),
+    }
 }
 
 /// Contains the host stack
 pub struct Stack<'stack, C, P: PacketPool> {
-    host: &'stack mut ManuallyDrop<BleHost<'stack, C, P>>,
+    host_state: &'stack mut ManuallyDrop<host::HostState<'stack, P>>,
+    controller: C,
     runner_taken: Cell<bool>,
 }
 
@@ -721,9 +716,9 @@ impl<'stack, C, P: PacketPool> Drop for Stack<'stack, C, P> {
     fn drop(&mut self) {
         // SAFETY: host was fully initialized in new() and has not been dropped.
         // Stack is the sole owner responsible for dropping BleHost.
-        // All shared &BleHost references (in Runner, Central, etc.) have already
+        // All shared &HostState references (in Runner, Central, etc.) have already
         // been dropped (reverse drop order), so no aliasing conflict.
-        unsafe { ManuallyDrop::drop(self.host) }
+        unsafe { ManuallyDrop::drop(self.host_state) }
     }
 }
 
@@ -731,42 +726,46 @@ impl<'stack, C, P: PacketPool> Drop for Stack<'stack, C, P> {
 ///
 /// Call [`build()`](StackBuilder::build) to finalize configuration and obtain the [`Stack`].
 pub struct StackBuilder<'stack, C, P: PacketPool> {
-    host: Option<&'stack mut ManuallyDrop<BleHost<'stack, C, P>>>,
+    pub(crate) host_state: Option<&'stack mut ManuallyDrop<host::HostState<'stack, P>>>,
+    controller: Option<C>,
 }
 
 impl<'stack, C, P: PacketPool> Drop for StackBuilder<'stack, C, P> {
     fn drop(&mut self) {
-        if let Some(host) = &mut self.host {
+        if let Some(host_state) = &mut self.host_state {
             // SAFETY: host was fully initialized in new() and has not been dropped.
             // `build()` was never called, leaving StackBuilder as the sole owner
             // responsible for dropping BleHost.
-            unsafe { ManuallyDrop::drop(host) }
+            unsafe { ManuallyDrop::drop(host_state) }
         }
     }
 }
 
 impl<'stack, C: Controller, P: PacketPool> StackBuilder<'stack, C, P> {
-    fn host(&mut self) -> &mut BleHost<'stack, C, P> {
-        self.host.as_mut().unwrap()
+    fn host_state(&mut self) -> &mut host::HostState<'stack, P> {
+        self.host_state.as_mut().unwrap()
     }
 
     /// Register an L2CAP SPSM (Simplified Protocol/Service Multiplexer) for accepting incoming connections.
     pub fn register_l2cap_spsm(mut self, spsm: u16) -> Self {
-        self.host().channels.register_spsm(spsm);
+        self.host_state().channels.register_spsm(spsm);
         self
     }
 
     /// Set the random address used by this host.
     pub fn set_random_address(mut self, address: Address) -> Self {
-        self.host().address.replace(address);
+        self.host_state().address.replace(address);
         #[cfg(feature = "security")]
-        self.host().connections.security_manager.set_local_address(address);
+        self.host_state()
+            .connections
+            .security_manager
+            .set_local_address(address);
         self
     }
 
     /// Enable BLE address privacy with the given Identity Resolving Key (IRK).
     ///
-    /// When privacy is enabled, the controller generates Resolvable Private Addresses (RPAs)
+    /// When privacy is enabled, Resolvable Private Addresses (RPAs) are generated
     /// that rotate periodically, preventing device tracking while allowing bonded peers to
     /// resolve the device's identity.
     ///
@@ -779,7 +778,7 @@ impl<'stack, C: Controller, P: PacketPool> StackBuilder<'stack, C, P> {
     /// resolving list updates to take effect.
     #[cfg(feature = "security")]
     pub fn enable_privacy(mut self, irk: IdentityResolvingKey) -> Self {
-        self.host().connections.security_manager.set_local_irk(irk);
+        self.host_state().connections.security_manager.set_local_irk(irk);
         self
     }
 
@@ -809,25 +808,14 @@ impl<'stack, C: Controller, P: PacketPool> StackBuilder<'stack, C, P> {
 
     /// Set the RPA (Resolvable Private Address) rotation timeout.
     ///
-    /// The controller will automatically generate a new RPA after this duration.
+    /// New RPAs will be generated after this duration. Note that host generated RPAs
+    /// (used for active scanning of and connecting to unbonded devices) will only rotate
+    /// when scanning, connection initiation, and legacy advertising are all idle.
+    ///
     /// Default is 900 seconds (15 minutes) per the BLE specification.
     #[cfg(feature = "security")]
     pub fn set_rpa_timeout(mut self, timeout: Duration) -> Self {
-        self.host().rpa_timeout.set(timeout);
-        self
-    }
-
-    /// Set the random generator seed for random generator used by security manager.
-    #[cfg(feature = "security")]
-    pub fn set_random_generator_seed<RNG: RngCore + CryptoRng>(mut self, _random_generator: &mut RNG) -> Self {
-        {
-            let mut random_seed = [0u8; 32];
-            _random_generator.fill_bytes(&mut random_seed);
-            self.host()
-                .connections
-                .security_manager
-                .set_random_generator_seed(random_seed);
-        }
+        self.host_state().rpa_timeout.set(timeout);
         self
     }
 
@@ -836,7 +824,7 @@ impl<'stack, C: Controller, P: PacketPool> StackBuilder<'stack, C, P> {
     /// Only relevant if the feature `security` is enabled.
     #[cfg(feature = "security")]
     pub fn set_io_capabilities(mut self, io_capabilities: IoCapabilities) -> Self {
-        self.host()
+        self.host_state()
             .connections
             .security_manager
             .set_io_capabilities(io_capabilities);
@@ -851,7 +839,7 @@ impl<'stack, C: Controller, P: PacketPool> StackBuilder<'stack, C, P> {
     /// Only relevant if the feature `legacy-pairing` is enabled.
     #[cfg(feature = "legacy-pairing")]
     pub fn set_secure_connections_only(mut self, enabled: bool) -> Self {
-        self.host()
+        self.host_state()
             .connections
             .security_manager
             .set_secure_connections_only(enabled);
@@ -865,17 +853,17 @@ impl<'stack, C: Controller, P: PacketPool> StackBuilder<'stack, C, P> {
     /// [`Peripheral`](peripheral::Peripheral) handles via [`Stack::central()`] and
     /// [`Stack::peripheral()`].
     pub fn build(mut self) -> Stack<'stack, C, P> {
-        #[cfg(all(feature = "security", not(feature = "dev-disable-csprng-seed-requirement")))]
-        if !self.host().connections.security_manager.get_random_generator_seeded() {
-            panic!(
-                "The security manager random number generator has not been seeded from a cryptographically secure random number generator"
-            )
-        }
-
         Stack {
-            host: self.host.take().unwrap(),
+            host_state: self.host_state.take().unwrap(),
+            controller: self.controller.take().unwrap(),
             runner_taken: Cell::new(false),
         }
+    }
+}
+
+impl<'stack, C, P: PacketPool> Stack<'stack, C, P> {
+    fn host(&self) -> BleHost<'_, C, P> {
+        BleHost::new(&self.controller, self.host_state)
     }
 }
 
@@ -888,7 +876,7 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
             !self.runner_taken.replace(true),
             "runner() can only be called once per Stack"
         );
-        Runner::new(self.host)
+        Runner::new(self.host())
     }
 
     /// Obtain a [`Central`](central::Central) handle for the central BLE role.
@@ -897,7 +885,7 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
     /// Concurrent connect operations are serialized internally.
     #[cfg(feature = "central")]
     pub fn central(&self) -> Central<'_, C, P> {
-        Central::new(self.host)
+        Central::new(self.host())
     }
 
     /// Obtain a [`Peripheral`](peripheral::Peripheral) handle for the peripheral BLE role.
@@ -906,7 +894,15 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
     /// Concurrent advertise operations are serialized internally.
     #[cfg(feature = "peripheral")]
     pub fn peripheral(&self) -> Peripheral<'_, C, P> {
-        Peripheral::new(self.host)
+        Peripheral::new(self.host())
+    }
+
+    /// Obtain an [`Iso`](iso::Iso) handle for isochronous-stream (CIS/BIS) HCI commands and data.
+    ///
+    /// This is a lightweight handle that can be created multiple times.
+    #[cfg(feature = "iso")]
+    pub fn iso(&self) -> iso::Iso<'_, C, P> {
+        iso::Iso::new(self.host())
     }
 
     /// Set the IO capabilities used by the security manager.
@@ -914,7 +910,7 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
     /// Only relevant if the feature `security` is enabled.
     #[cfg(feature = "security")]
     pub fn set_io_capabilities(&self, io_capabilities: IoCapabilities) {
-        self.host
+        self.host_state
             .connections
             .security_manager
             .set_io_capabilities(io_capabilities);
@@ -928,7 +924,7 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
     /// Only relevant if the feature `legacy-pairing` is enabled.
     #[cfg(feature = "legacy-pairing")]
     pub fn set_secure_connections_only(&self, enabled: bool) {
-        self.host
+        self.host_state
             .connections
             .security_manager
             .set_secure_connections_only(enabled);
@@ -947,9 +943,9 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
     where
         C: ControllerCmdSync<LeSetResolvablePrivateAddrTimeout>,
     {
-        self.host.rpa_timeout.set(timeout);
-        if self.host.is_initialized() {
-            self.host
+        self.host().rpa_timeout().set(timeout);
+        if self.host().is_initialized() {
+            self.host()
                 .command(LeSetResolvablePrivateAddrTimeout::new(
                     bt_hci::param::Duration::from_secs(timeout.as_secs() as u32),
                 ))
@@ -964,7 +960,7 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
         T: SyncCmd,
         C: ControllerCmdSync<T>,
     {
-        self.host.command(cmd).await
+        self.host().command(cmd).await
     }
 
     /// Run an async HCI command where the response will generate an event later.
@@ -973,7 +969,7 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
         T: AsyncCmd,
         C: ControllerCmdAsync<T>,
     {
-        self.host.async_command(cmd).await
+        self.host().async_command(cmd).await
     }
 
     /// Read the minimum supported connection interval from the controller.
@@ -983,17 +979,19 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
     where
         C: ControllerCmdSync<LeReadMinimumSupportedConnectionInterval>,
     {
-        self.host.command(LeReadMinimumSupportedConnectionInterval::new()).await
+        self.host()
+            .command(LeReadMinimumSupportedConnectionInterval::new())
+            .await
     }
 
     /// Read current host metrics
     pub fn metrics<F: FnOnce(&HostMetrics) -> R, R>(&self, f: F) -> R {
-        self.host.metrics(f)
+        self.host().metrics(f)
     }
 
     /// Log status information of the host
     pub fn log_status(&self, verbose: bool) {
-        self.host.log_status(verbose);
+        self.host().log_status(verbose);
     }
 
     #[cfg(feature = "security")]
@@ -1002,19 +1000,19 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
     /// The returned data should be transferred to the peer device via an out-of-band
     /// channel (NFC, QR code, etc.) before pairing begins.
     pub fn get_local_oob_data(&self) -> OobData {
-        self.host.connections.security_manager.get_local_oob_data()
+        self.host_state.connections.security_manager.get_local_oob_data()
     }
 
     #[cfg(feature = "security")]
     /// Get the local address configured on the security manager.
     pub fn get_local_address(&self) -> Option<Address> {
-        self.host.connections.security_manager.get_local_address()
+        self.host_state.connections.security_manager.get_local_address()
     }
 
     /// Check whether BLE address privacy is enabled.
     #[cfg(feature = "security")]
     pub fn is_privacy_enabled(&self) -> bool {
-        self.host.is_privacy_enabled()
+        self.host().is_privacy_enabled()
     }
 
     #[cfg(feature = "security")]
@@ -1027,14 +1025,14 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
     pub fn add_bond_information(&self, bond_information: BondInformation) -> Result<(), Error> {
         let identity = bond_information.identity;
         let result = self
-            .host
-            .connections
+            .host()
+            .connections()
             .security_manager
             .add_bond_information(bond_information);
         #[cfg(feature = "security")]
         if result.is_ok() {
-            self.host
-                .resolving_list_state
+            self.host()
+                .resolving_list_state()
                 .borrow_mut()
                 .push(crate::host::ResolvingListUpdate::Add(identity));
         }
@@ -1049,11 +1047,15 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
     /// connecting are all idle. Applications should ensure periodic idle windows to allow
     /// resolving list updates to take effect.
     pub fn remove_bond_information(&self, identity: Identity) -> Result<(), Error> {
-        let result = self.host.connections.security_manager.remove_bond_information(identity);
+        let result = self
+            .host()
+            .connections()
+            .security_manager
+            .remove_bond_information(identity);
         #[cfg(feature = "security")]
         if result.is_ok() {
-            self.host
-                .resolving_list_state
+            self.host()
+                .resolving_list_state()
                 .borrow_mut()
                 .push(crate::host::ResolvingListUpdate::Remove(identity));
         }
@@ -1063,22 +1065,22 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
     #[cfg(feature = "security")]
     /// Access bonded devices
     pub fn with_bond_information<R>(&self, f: impl FnOnce(&[BondInformation]) -> R) -> R {
-        f(&self.host.connections.security_manager.get_bond_information())
+        f(&self.host_state.connections.security_manager.get_bond_information())
     }
 
     /// Get a connection by its peer address
     pub fn get_connection_by_peer_address(&self, peer_address: Address) -> Option<Connection<'_, P>> {
-        self.host.connections.get_connection_by_peer_address(peer_address)
+        self.host_state.connections.get_connection_by_peer_address(peer_address)
     }
 
     /// Get a connection by its handle
     pub fn get_connected_handle(&self, handle: ConnHandle) -> Option<Connection<'_, P>> {
-        self.host.connections.get_connected_handle(handle)
+        self.host_state.connections.get_connected_handle(handle)
     }
 
     /// Iterate over all currently connected connections.
     pub fn connections(&self) -> connection_manager::ConnectedIter<'_, P> {
-        self.host.connections.connections()
+        self.host_state.connections.connections()
     }
 }
 

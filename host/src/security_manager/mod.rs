@@ -12,6 +12,8 @@ use core::task::Poll;
 
 use bt_hci::event::le::{LeEventKind, LeEventPacket, LeLongTermKeyRequest};
 use bt_hci::event::{EncryptionChangeV1, EncryptionKeyRefreshComplete, EventKind, EventPacket};
+#[cfg(feature = "central")]
+use bt_hci::param::BdAddr;
 use bt_hci::param::{ConnHandle, EncryptionEnabledLevel, LeConnRole};
 use bt_hci::FromHciBytes;
 pub use crypto::{IdentityResolvingKey, LongTermKey};
@@ -48,7 +50,7 @@ pub(crate) enum SecurityEventData {
     /// Pairing timer changed
     TimerChange,
     /// A new bond was stored during pairing
-    BondAdded(crate::Identity),
+    BondAdded(ConnHandle, crate::Identity),
 }
 
 /// Bond Information
@@ -109,22 +111,8 @@ impl defmt::Format for BondInformation {
 struct SecurityManagerData {
     /// Local device address
     local_address: Option<Address>,
-    /// Random generator seeded
-    random_generator_seeded: bool,
-    /// Local Identity Resolving Key. Set whenever we advertise our IRK — either
-    /// because full RPA privacy is enabled (`enable_privacy`) OR because we only
-    /// want to DISTRIBUTE the IRK during bonding while keeping a fixed
-    /// (static/public) advertising address (`distribute_identity_key`). The SMP
-    /// key-distribution decision keys off this being non-zero; RPA address usage
-    /// keys off `own_rpa_enabled` below, so the two are independent.
+    /// Local Identity Resolving Key (set when privacy is enabled)
     local_irk: Option<IdentityResolvingKey>,
-    /// Whether our OWN advertising address should be a rotating Resolvable
-    /// Private Address (true) vs. the fixed address configured via
-    /// `set_random_address` (false). Only `enable_privacy` sets this; a plain
-    /// `distribute_identity_key` leaves it false so the IRK is shared during
-    /// bonding without switching the on-air address to an RPA. This is what
-    /// lets us match Meshtastic (fixed address + IRK distribution).
-    own_rpa_enabled: bool,
 }
 
 impl SecurityManagerData {
@@ -132,9 +120,7 @@ impl SecurityManagerData {
     fn new() -> Self {
         Self {
             local_address: None,
-            random_generator_seeded: false,
             local_irk: None,
-            own_rpa_enabled: false,
         }
     }
 }
@@ -223,7 +209,6 @@ struct Inner {
 struct SmpCommand<'a> {
     command: Command,
     payload: &'a [u8],
-    peer_address: Address,
     handle: ConnHandle,
     peer_identity: Identity,
 }
@@ -249,14 +234,20 @@ impl Inner {
     /// Get the peer address to use for pairing calculations.
     /// When privacy is enabled and a peer RPA was used for this connection, use it;
     /// otherwise fall back to the identity address.
-    fn connection_peer_address<P>(identity_addr: Address, storage: &ConnectionStorage<P>) -> Address {
+    fn connection_peer_address<P>(storage: &ConnectionStorage<P>) -> Address {
         if let Some(rpa) = storage.resolvable_addrs.peer {
-            return Address {
+            Address {
                 kind: bt_hci::param::AddrKind::RANDOM,
                 addr: rpa,
-            };
+            }
+        } else {
+            storage.peer_identity.addr
         }
-        identity_addr
+    }
+
+    fn pairing_sm_for<'a, P>(sm: Option<&'a mut Pairing>, storage: &ConnectionStorage<P>) -> Option<&'a mut Pairing> {
+        let expected = Self::connection_peer_address(storage);
+        sm.filter(|sm| sm.peer_address() == expected)
     }
 
     fn handle_peripheral<P: PacketPool>(
@@ -270,13 +261,12 @@ impl Inner {
         let SmpCommand {
             command,
             payload,
-            peer_address,
             handle,
             peer_identity,
         } = *cmd;
-        if self.is_idle() {
+        if self.is_idle() && command == Command::PairingRequest {
             let local_address = self.connection_local_address(storage)?;
-            let peer_address = Self::connection_peer_address(peer_address, storage);
+            let peer_address = Self::connection_peer_address(storage);
             let local_io = self.io_capabilities;
 
             #[cfg(feature = "legacy-pairing")]
@@ -314,7 +304,9 @@ impl Inner {
             && payload.len() >= 4
             && (!AuthReq::from(payload[2]).secure_connection()
                 || payload[3] < crate::security_manager::constants::ENCRYPTION_KEY_SIZE_128_BITS)
-            && self.pairing_sm.as_ref().is_some_and(|p| p.is_lesc_peripheral())
+            && self.pairing_sm.as_ref().is_some_and(|sm| {
+                sm.peer_address() == Self::connection_peer_address(storage) && sm.is_lesc_peripheral()
+            })
         {
             if self.secure_connections_only {
                 if payload[3] < crate::security_manager::constants::ENCRYPTION_KEY_SIZE_128_BITS {
@@ -322,19 +314,17 @@ impl Inner {
                 }
                 return Err(Error::Security(Reason::AuthenticationRequirements));
             }
-            let old = self.pairing_sm.take().unwrap();
-            self.pairing_sm = Some(old.switch_to_legacy_peripheral()?);
+            if let Some(old) = self.pairing_sm.take() {
+                self.pairing_sm = Some(old.switch_to_legacy_peripheral()?);
+            }
         }
 
-        if self.pairing_sm.as_ref().unwrap().is_central() {
+        let Some(pairing_sm) = Self::pairing_sm_for(self.pairing_sm.as_mut(), storage) else {
             return Err(Error::InvalidState);
-        }
-        let address = self.pairing_sm.as_ref().unwrap().peer_address();
+        };
 
-        if address != peer_address {
-            // TODO Is this correct?
-            self.pairing_sm = None;
-            return Err(Error::InvalidValue);
+        if pairing_sm.is_central() {
+            return Err(Error::InvalidState);
         }
 
         let mut ops = PairingOpsImpl {
@@ -348,10 +338,7 @@ impl Inner {
             peer_identity,
             state: &self.state,
         };
-        self.pairing_sm
-            .as_mut()
-            .unwrap()
-            .handle_l2cap_command(command, payload, &mut ops, &mut self.rng)
+        pairing_sm.handle_l2cap_command(command, payload, &mut ops, &mut self.rng)
     }
 
     fn handle_central<P: PacketPool>(
@@ -365,14 +352,13 @@ impl Inner {
         let SmpCommand {
             command,
             payload,
-            peer_address,
             handle,
             peer_identity,
         } = *cmd;
-        if self.is_idle() {
+        if self.is_idle() && command == Command::SecurityRequest {
             self.pairing_sm = Some(Pairing::new_central(
                 self.connection_local_address(storage)?,
-                Self::connection_peer_address(peer_address, storage),
+                Self::connection_peer_address(storage),
                 self.io_capabilities,
             ));
         }
@@ -384,7 +370,10 @@ impl Inner {
             && payload.len() >= 4
             && (!AuthReq::from(payload[2]).secure_connection()
                 || payload[3] < crate::security_manager::constants::ENCRYPTION_KEY_SIZE_128_BITS)
-            && self.pairing_sm.as_ref().is_some_and(|p| p.is_lesc_central())
+            && self
+                .pairing_sm
+                .as_ref()
+                .is_some_and(|sm| sm.peer_address() == Self::connection_peer_address(storage) && sm.is_lesc_central())
         {
             if self.secure_connections_only {
                 if payload[3] < crate::security_manager::constants::ENCRYPTION_KEY_SIZE_128_BITS {
@@ -392,19 +381,17 @@ impl Inner {
                 }
                 return Err(Error::Security(Reason::AuthenticationRequirements));
             }
-            let old = self.pairing_sm.take().unwrap();
-            self.pairing_sm = Some(old.switch_to_legacy_central()?);
+            if let Some(old) = self.pairing_sm.take() {
+                self.pairing_sm = Some(old.switch_to_legacy_central()?);
+            }
         }
 
-        if !self.pairing_sm.as_ref().unwrap().is_central() {
+        let Some(pairing_sm) = Self::pairing_sm_for(self.pairing_sm.as_mut(), storage) else {
             return Err(Error::InvalidState);
-        }
-        let address = self.pairing_sm.as_ref().unwrap().peer_address();
+        };
 
-        if address != peer_address {
-            // TODO Is this correct?
-            self.pairing_sm = None;
-            return Err(Error::InvalidValue);
+        if !pairing_sm.is_central() {
+            return Err(Error::InvalidState);
         }
 
         let mut ops = PairingOpsImpl {
@@ -418,10 +405,7 @@ impl Inner {
             peer_identity,
             state: &self.state,
         };
-        self.pairing_sm
-            .as_mut()
-            .unwrap()
-            .handle_l2cap_command(command, payload, &mut ops, &mut self.rng)
+        pairing_sm.handle_l2cap_command(command, payload, &mut ops, &mut self.rng)
     }
 
     fn handle_pairing_event<P: PacketPool>(
@@ -432,14 +416,14 @@ impl Inner {
         connections: &ConnectionManager<'_, P>,
         storage: &ConnectionStorage<P::Packet>,
     ) -> Result<(), Error> {
-        if let Some(sm) = self.pairing_sm.as_mut() {
+        if let Some(sm) = Self::pairing_sm_for(self.pairing_sm.as_mut(), storage) {
             let mut ops = PairingOpsImpl {
                 bonds,
                 events,
                 secret_key: &self.secret_key,
                 public_key: &self.public_key,
-                peer_identity: storage.peer_identity.ok_or(Error::InvalidValue)?,
-                conn_handle: storage.handle.ok_or(Error::InvalidValue)?,
+                peer_identity: storage.peer_identity,
+                conn_handle: storage.handle,
                 connections,
                 storage,
                 state: &self.state,
@@ -449,9 +433,10 @@ impl Inner {
                 sm.reset_timeout();
                 let _ = events.try_send(SecurityEventData::TimerChange);
             }
-            return res;
+            res
+        } else {
+            Err(Error::InvalidState)
         }
-        Ok(())
     }
 
     fn handle_encryption_success<P: PacketPool>(
@@ -462,16 +447,17 @@ impl Inner {
         connections: &ConnectionManager<'_, P>,
         storage: &mut ConnectionStorage<P::Packet>,
     ) -> Result<(), Error> {
-        let res: Result<(), Error> = if let Some(sm) = self.pairing_sm.as_mut() {
+        let mut bond = None;
+        let res: Result<(), Error> = if let Some(sm) = Self::pairing_sm_for(self.pairing_sm.as_mut(), storage) {
             let mut ops = PairingOpsImpl {
                 bonds,
                 events,
                 secret_key: &self.secret_key,
                 public_key: &self.public_key,
-                peer_identity: storage.peer_identity.ok_or(Error::InvalidValue)?,
+                peer_identity: storage.peer_identity,
                 connections,
                 storage,
-                conn_handle: storage.handle.ok_or(Error::InvalidValue)?,
+                conn_handle: storage.handle,
                 state: &self.state,
             };
             let res = sm.handle_event(pairing::Event::LinkEncryptedResult(encrypted), &mut ops, &mut self.rng);
@@ -488,30 +474,29 @@ impl Inner {
                 let _ = events.try_send(SecurityEventData::TimerChange);
             }
             res
-        } else if let Some(identity) = storage.peer_identity.as_ref() {
+        } else {
             match bonds
                 .iter()
-                .find(|bond| bond.identity.match_identity(identity))
+                .find(|bond| bond.identity.match_identity(&storage.peer_identity))
                 .cloned()
             {
-                Some(bond) if encrypted => {
-                    info!("[smp] Encrypted using bond {:?}", bond.identity);
-                    storage.security_level = bond.security_level;
+                Some(b) if encrypted => {
+                    info!("[smp] Encrypted using bond {:?}", b.identity);
+                    storage.security_level = b.security_level;
                     #[cfg(feature = "legacy-pairing")]
                     {
-                        storage.encryption_key_len = bond.encryption_key_len;
+                        storage.encryption_key_len = b.encryption_key_len;
                     }
+                    bond = Some(b);
                 }
                 _ => {
                     warn!(
                         "[smp] Either encryption failed to enable or bond not found for {:?}",
-                        identity
+                        storage.peer_identity
                     );
                     storage.security_level = SecurityLevel::NoEncryption;
                 }
             }
-            Ok(())
-        } else {
             Ok(())
         };
 
@@ -519,6 +504,7 @@ impl Inner {
         if encrypted && storage.security_level != SecurityLevel::NoEncryption {
             let _ = storage.events.try_send(ConnectionEvent::Encrypted {
                 security_level: storage.security_level,
+                bond,
             });
         }
 
@@ -532,7 +518,11 @@ impl Inner {
         connections: &ConnectionManager<'_, P>,
         storage: &mut ConnectionStorage<P::Packet>,
     ) {
-        if let Some(sm) = self.pairing_sm.as_mut() {
+        let has_bond = bonds.iter().any(|b| b.identity.match_identity(&storage.peer_identity));
+        if has_bond {
+            storage.bond_rejected = true;
+        }
+        if let Some(sm) = Self::pairing_sm_for(self.pairing_sm.as_mut(), storage) {
             // If we were waiting for bonded encryption, mark the bond as
             // rejected on this connection so the next pairing attempt will
             // skip bonded encryption and initiate fresh pairing instead.
@@ -546,10 +536,10 @@ impl Inner {
                     events,
                     secret_key: &self.secret_key,
                     public_key: &self.public_key,
-                    peer_identity: storage.peer_identity.unwrap_or_default(),
+                    peer_identity: storage.peer_identity,
                     connections,
                     storage,
-                    conn_handle: storage.handle.unwrap_or(ConnHandle::new(0)),
+                    conn_handle: storage.handle,
                     state: &self.state,
                 },
                 &mut self.rng,
@@ -572,26 +562,21 @@ impl Inner {
         storage: &ConnectionStorage<<P as PacketPool>::Packet>,
         user_initiated: bool,
     ) -> Result<(), Error> {
-        let role = storage.role.ok_or(Error::InvalidValue)?;
+        let role = storage.role;
 
         if !self.is_idle() {
             // If pairing is already in progress for this peer, consider the request fulfilled.
-            let peer_identity = storage.peer_identity.ok_or(Error::InvalidValue)?;
-            let peer_address = peer_identity.addr;
-            if self
-                .pairing_sm
-                .as_ref()
-                .is_some_and(|sm| sm.peer_address() == peer_address && sm.result().is_none())
-            {
+            if Self::pairing_sm_for(self.pairing_sm.as_mut(), storage).is_some() {
                 return Ok(());
+            } else {
+                return Err(Error::InvalidState);
             }
-            return Err(Error::InvalidState);
         }
 
-        let handle = storage.handle.ok_or(Error::InvalidValue)?;
-        let peer_identity = storage.peer_identity.ok_or(Error::InvalidValue)?;
+        let handle = storage.handle;
+        let peer_identity = storage.peer_identity;
         let local_address = self.connection_local_address(storage)?;
-        let peer_address = Self::connection_peer_address(peer_identity.addr, storage);
+        let peer_address = Self::connection_peer_address(storage);
         let local_io = self.io_capabilities;
         let mut ops = PairingOpsImpl {
             bonds,
@@ -670,13 +655,12 @@ impl<'d> SecurityManager<'d> {
         self.inner.borrow_mut().secure_connections_only = enabled;
     }
 
-    /// Set the current local address
+    /// Seed the security manager's CSPRNG and regenerate the persistent LESC keypair.
     pub(crate) fn set_random_generator_seed(&self, random_seed: [u8; 32]) {
         let mut inner = self.inner.borrow_mut();
         inner.rng = ChaCha12Rng::from_seed(random_seed);
         inner.secret_key = crypto::SecretKey::new(&mut inner.rng);
         inner.public_key = inner.secret_key.public_key();
-        inner.state.random_generator_seeded = true;
     }
 
     /// Set the current local address
@@ -737,11 +721,6 @@ impl<'d> SecurityManager<'d> {
         })
     }
 
-    /// Has the random generator been seeded?
-    pub(crate) fn get_random_generator_seeded(&self) -> bool {
-        self.inner.borrow().state.random_generator_seeded
-    }
-
     /// Generate local OOB data for LESC pairing.
     ///
     /// The returned data should be exchanged with the peer via an out-of-band channel.
@@ -762,35 +741,23 @@ impl<'d> SecurityManager<'d> {
         self.inner.borrow().state.local_address
     }
 
-    /// Set the local Identity Resolving Key (IRK) for FULL RPA privacy: our own
-    /// advertising address becomes a rotating Resolvable Private Address AND the
-    /// IRK is distributed during bonding. Used by `Stack::enable_privacy`.
+    /// Set the local Identity Resolving Key (IRK) for privacy.
     pub(crate) fn set_local_irk(&self, irk: IdentityResolvingKey) {
-        let mut inner = self.inner.borrow_mut();
-        inner.state.local_irk = Some(irk);
-        inner.state.own_rpa_enabled = true;
-    }
-
-    /// Set the local IRK for DISTRIBUTION-ONLY: the IRK is shared during bonding
-    /// (so centrals like Android/iOS complete a full LE-Secure-Connections bond),
-    /// but our advertising address stays the fixed one from `set_random_address`
-    /// (NO rotating RPA, NO resolving-list machinery). Matches Meshtastic's
-    /// fixed-address + IRK-distribution behavior. `own_rpa_enabled` is left
-    /// false, so `Host::is_privacy_enabled()` stays false.
-    pub(crate) fn distribute_identity_key(&self, irk: IdentityResolvingKey) {
         self.inner.borrow_mut().state.local_irk = Some(irk);
     }
 
     /// Get the local Identity Resolving Key (IRK).
-    /// Returns `Some` when an IRK is configured (privacy OR distribution-only).
+    /// Returns `Some` when privacy is enabled, `None` otherwise.
     pub(crate) fn get_local_irk(&self) -> Option<IdentityResolvingKey> {
         self.inner.borrow().state.local_irk
     }
 
-    /// Whether our OWN advertising address should be a rotating RPA. Only true
-    /// when `enable_privacy` was used; `distribute_identity_key` leaves it false.
-    pub(crate) fn is_own_rpa_enabled(&self) -> bool {
-        self.inner.borrow().state.own_rpa_enabled
+    /// Generate a local resolvable private address when privacy is enabled.
+    #[cfg(feature = "central")]
+    pub(crate) fn generate_local_rpa(&self) -> Option<BdAddr> {
+        let mut inner = self.inner.borrow_mut();
+        let irk = inner.state.local_irk?;
+        Some(BdAddr::new(irk.generate_resolvable_address(&mut inner.rng)))
     }
 
     /// Add a bonded device
@@ -867,9 +834,8 @@ impl<'d> SecurityManager<'d> {
         let cmd = SmpCommand {
             command,
             payload: &buffer[1..size],
-            peer_address: storage.peer_identity.ok_or(Error::InvalidValue)?.addr,
-            handle: storage.handle.ok_or(Error::InvalidValue)?,
-            peer_identity: storage.peer_identity.ok_or(Error::InvalidValue)?,
+            handle: storage.handle,
+            peer_identity: storage.peer_identity,
         };
         self.inner.borrow_mut().handle_peripheral(
             &mut self.bonds.borrow_mut(),
@@ -890,9 +856,8 @@ impl<'d> SecurityManager<'d> {
         let cmd = SmpCommand {
             command,
             payload: &buffer[1..size],
-            peer_address: storage.peer_identity.ok_or(Error::InvalidValue)?.addr,
-            handle: storage.handle.ok_or(Error::InvalidValue)?,
-            peer_identity: storage.peer_identity.ok_or(Error::InvalidValue)?,
+            handle: storage.handle,
+            peer_identity: storage.peer_identity,
         };
         self.inner
             .borrow_mut()
@@ -906,7 +871,7 @@ impl<'d> SecurityManager<'d> {
         connections: &ConnectionManager<P>,
         storage: &ConnectionStorage<P::Packet>,
     ) -> Result<(), Error> {
-        let role = storage.role.ok_or(Error::InvalidValue)?;
+        let role = storage.role;
 
         let result = if role == LeConnRole::Peripheral {
             self.handle_peripheral(pdu, connections, storage)
@@ -952,7 +917,7 @@ impl<'d> SecurityManager<'d> {
 
             // Cease sending security manager messages on timeout
             if *error != Error::Timeout {
-                let handle = storage.handle.ok_or(Error::InvalidValue)?;
+                let handle = storage.handle;
                 let mut packet = self.prepare_packet(Command::PairingFailed, connections)?;
                 let payload = packet.payload_mut();
                 payload[0] = u8::from(reason);
@@ -999,21 +964,20 @@ impl<'d> SecurityManager<'d> {
     }
 
     /// Channel disconnected
-    pub(crate) fn disconnect(&self, identity: &Identity) {
+    pub(crate) fn disconnect<P>(&self, storage: &ConnectionStorage<P>) {
         {
             let mut inner = self.inner.borrow_mut();
             if inner
                 .pairing_sm
-                .as_ref()
-                .is_some_and(|sm| sm.peer_address() == identity.addr)
+                .take_if(|p| p.peer_address() == Inner::connection_peer_address(storage))
+                .is_some()
             {
-                inner.pairing_sm = None;
                 inner.finished_waker.wake();
             }
         }
         self.bonds
             .borrow_mut()
-            .retain(|x| x.is_bonded || x.identity != *identity);
+            .retain(|x| x.is_bonded || x.identity != storage.peer_identity);
     }
 
     /// Handle recevied events from HCI
@@ -1215,7 +1179,9 @@ impl<'sm, 'cm, 'cm2, 'cs, P: PacketPool> PairingOps<P> for PairingOpsImpl<'sm, '
     fn try_update_bond_information(&mut self, bond: &BondInformation) -> Result<(), Error> {
         add_bond(self.bonds, bond.clone())?;
         if bond.identity.irk.is_some() {
-            let _ = self.events.try_send(SecurityEventData::BondAdded(bond.identity));
+            let _ = self
+                .events
+                .try_send(SecurityEventData::BondAdded(self.conn_handle, bond.identity));
         }
         Ok(())
     }
@@ -1312,5 +1278,132 @@ impl<'sm, 'cm, 'cm2, 'cs, P: PacketPool> PairingOps<P> for PairingOpsImpl<'sm, '
 
     fn local_identity_address(&self) -> Result<Address, Error> {
         self.state.local_address.ok_or(Error::InvalidValue)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use core::cell::RefCell;
+    use std::boxed::Box;
+
+    use bt_hci::param::{ConnHandle, LeConnRole};
+    use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+    use rand_chacha::ChaCha12Rng;
+    use rand_core::SeedableRng;
+
+    use super::*;
+    use crate::connection::ConnParams;
+    use crate::connection_manager::{ConnectionManager, ConnectionStorage};
+    use crate::prelude::DefaultPacketPool;
+    use crate::IoCapabilities;
+
+    fn setup_manager() -> &'static ConnectionManager<'static, DefaultPacketPool> {
+        let storage: &RefCell<[_]> = Box::leak(Box::new(RefCell::new([const { ConnectionStorage::new() }; 2])));
+        let bond_storage: &RefCell<heapless::VecView<_>> =
+            Box::leak(Box::new(RefCell::new(heapless::Vec::<BondInformation, 4>::new())));
+        Box::leak(Box::new(ConnectionManager::new(storage, bond_storage)))
+    }
+
+    fn test_inner(peer_address: Address) -> Inner {
+        let mut rng = ChaCha12Rng::from_seed([7; 32]);
+        let secret_key = crypto::SecretKey::new(&mut rng);
+        let public_key = secret_key.public_key();
+        Inner {
+            rng,
+            secret_key,
+            public_key,
+            state: SecurityManagerData {
+                local_address: Some(Address::random([1, 2, 3, 4, 5, 6])),
+                local_irk: None,
+            },
+            pairing_sm: Some(Pairing::new_peripheral(
+                Address::random([1, 2, 3, 4, 5, 6]),
+                peer_address,
+                IoCapabilities::NoInputNoOutput,
+            )),
+            finished_waker: WakerRegistration::new(),
+            io_capabilities: IoCapabilities::NoInputNoOutput,
+            #[cfg(feature = "legacy-pairing")]
+            secure_connections_only: false,
+        }
+    }
+
+    #[test]
+    fn encryption_success_uses_bond_when_pairing_sm_is_for_other_peer() {
+        let mgr = setup_manager();
+        let handle = ConnHandle::new(2);
+        let current = Identity::from(Address::random([0x10, 2, 3, 4, 5, 6]));
+        let other = Address::random([0x40, 2, 3, 4, 5, 6]);
+        unwrap!(mgr.connect(handle, current.addr, LeConnRole::Peripheral, ConnParams::new()));
+
+        let mut inner = test_inner(other);
+        let mut bonds: heapless::Vec<BondInformation, 4> = heapless::Vec::new();
+        unwrap!(bonds.push(BondInformation::new(
+            current,
+            LongTermKey::new(1),
+            SecurityLevel::EncryptedAuthenticated,
+            true,
+        )));
+        let events = Channel::<NoopRawMutex, SecurityEventData, 3>::new();
+
+        unwrap!(mgr.with_connected_handle(handle, |storage| {
+            unwrap!(inner.handle_encryption_success(&mut bonds, &events, true, mgr, storage));
+            assert_eq!(storage.security_level, SecurityLevel::EncryptedAuthenticated);
+            assert!(inner.pairing_sm.is_some());
+            assert_eq!(inner.pairing_sm.as_ref().unwrap().peer_address(), other);
+            Ok(())
+        }));
+    }
+
+    #[test]
+    fn encryption_failure_rejects_current_bond_without_touching_other_peer_sm() {
+        let mgr = setup_manager();
+        let handle = ConnHandle::new(3);
+        let current = Identity::from(Address::random([0x11, 2, 3, 4, 5, 6]));
+        let other = Address::random([0x41, 2, 3, 4, 5, 6]);
+        unwrap!(mgr.connect(handle, current.addr, LeConnRole::Peripheral, ConnParams::new()));
+
+        let mut inner = test_inner(other);
+        let mut bonds: heapless::Vec<BondInformation, 4> = heapless::Vec::new();
+        unwrap!(bonds.push(BondInformation::new(
+            current,
+            LongTermKey::new(2),
+            SecurityLevel::Encrypted,
+            true,
+        )));
+        let events = Channel::<NoopRawMutex, SecurityEventData, 3>::new();
+
+        unwrap!(mgr.with_connected_handle(handle, |storage| {
+            inner.handle_encryption_failure(&mut bonds, &events, mgr, storage);
+            assert!(storage.bond_rejected);
+            assert!(inner.pairing_sm.is_some());
+            assert_eq!(inner.pairing_sm.as_ref().unwrap().peer_address(), other);
+            Ok(())
+        }));
+    }
+
+    #[test]
+    fn pairing_event_for_other_peer_fails_without_advancing_sm() {
+        let mgr = setup_manager();
+        let handle = ConnHandle::new(4);
+        let current = Identity::from(Address::random([0x12, 2, 3, 4, 5, 6]));
+        let other = Address::random([0x42, 2, 3, 4, 5, 6]);
+        unwrap!(mgr.connect(handle, current.addr, LeConnRole::Peripheral, ConnParams::new()));
+
+        let mut inner = test_inner(other);
+        let mut bonds: heapless::Vec<BondInformation, 4> = heapless::Vec::new();
+        let events = Channel::<NoopRawMutex, SecurityEventData, 3>::new();
+
+        unwrap!(mgr.with_connected_handle(handle, |storage| {
+            assert_eq!(
+                inner.handle_pairing_event(&mut bonds, &events, pairing::Event::PassKeyConfirm, mgr, storage),
+                Err(Error::InvalidState)
+            );
+            assert!(inner.pairing_sm.is_some());
+            assert_eq!(inner.pairing_sm.as_ref().unwrap().peer_address(), other);
+            Ok(())
+        }));
     }
 }
