@@ -444,9 +444,31 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
                     return Ok(());
                 }
             }
-            // Should be unreachable if the max connections (CONN_MAX) matches that defined
-            // in HostResources...
-            warn!("[server] unable to obtain client attributes slot");
+            // All slots claim `is_connected` — but this connect() is only reached
+            // for a connection the CONTROLLER already ADMITTED, and the controller
+            // enforces the same CONN_MAX cap as this table. So the true number of
+            // LIVE connections is < CONN_MAX, which means at least one slot here is
+            // STALE: its `is_connected` flag was never cleared because disconnect()
+            // matches by `peer_identity`, and that identity can differ between
+            // connect and disconnect (the peer resolved an RPA to a bonded identity,
+            // rotated its private address, or dropped abnormally mid-pairing before
+            // an identity was established). Rather than refuse — which permanently
+            // WEDGES the GATT server ("unable to obtain client attributes slot" =>
+            // every future client rejected, a stale-bond or rapidly-reconnecting
+            // central can DoS the device) — reclaim a stale slot. Worst case we
+            // reclaim a genuine client's cached CCCD config, which it simply
+            // re-subscribes on next use; that is strictly better than wedging.
+            if let Some((client, table)) = n.iter_mut().next() {
+                warn!(
+                    "[server] all attribute slots claim connected but a new connection was \
+                     admitted — reclaiming a stale slot (prevents GATT-server wedge)"
+                );
+                *client = Client::default();
+                client.is_connected = true;
+                client.set_identity(*peer_identity);
+                table.clear();
+                return Ok(());
+            }
             Err(Error::ConnectionLimitReached)
         })
     }
