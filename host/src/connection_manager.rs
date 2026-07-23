@@ -908,7 +908,20 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
         {
             for storage in self.connections.borrow().iter() {
                 match storage.state {
-                    ConnectionState::Connected if storage.handle == handle => {
+                    // FW-BLE-PAIRDISPATCH fix: also process SMP while
+                    // the link is still `Connecting` (LL connection is up — handle
+                    // is set — but the app hasn't `accept()`ed it to `Connected`
+                    // yet). A central can send its PairingRequest immediately after
+                    // the connection completes, BEFORE the peripheral app accepts;
+                    // dropping it here (Connected-only gate) was why the nRF techo
+                    // never responded → Authentication Failure (HW-root-caused +
+                    // validated 2026-07-23: with this relax the first SMP PDU is
+                    // dispatched while `connected=false` and the pairing completes
+                    // to security_level=Encrypted). SMP doesn't need the app-level
+                    // accept, only the live LL link.
+                    ConnectionState::Connected | ConnectionState::Connecting
+                        if storage.handle == handle =>
+                    {
                         if storage.smp_timeout {
                             warn!("Ignoring security channel packet after SMP timeout");
                             return Ok(());
