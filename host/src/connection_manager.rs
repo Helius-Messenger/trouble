@@ -526,6 +526,18 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                 {
                     storage.bond_rejected = false;
                     storage.smp_timeout = false;
+                    // FW-BLE-BONDPERSIST: a new connection is bondable by default,
+                    // set at ESTABLISHMENT (Connecting) — before the app calls
+                    // accept() and before the SMP can process an early
+                    // PairingRequest (centrals send it while the link is still
+                    // Connecting; see FW-BLE-PAIRDISPATCH). Without this the SMP
+                    // reads the default `bondable=false`, answers the PairingResponse
+                    // NoBonding → `want_bonding()`=false → the link encrypts but no
+                    // bond is persisted. The app's post-accept `set_bondable(true)`
+                    // was too late (it raced the early PairingRequest). Bonding is
+                    // still peer-gated (both sides must advertise Bonding), so a
+                    // NoBonding central never bonds regardless.
+                    storage.bondable = true;
                 }
                 #[cfg(feature = "security")]
                 {
