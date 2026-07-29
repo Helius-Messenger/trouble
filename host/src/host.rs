@@ -1897,16 +1897,42 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                     }
                     CancelledCommandState::Advertise(ext) => {
                         trace!("[host] disabling advertising");
-                        if ext {
-                            host.command(LeSetExtAdvEnable::new(false, &[])).await?
+                        // Cancelling advertising that is ALREADY stopped is success,
+                        // not failure — the desired end state (not advertising)
+                        // already holds. The controller auto-stops advertising when a
+                        // connection is established, so under connect/disconnect churn
+                        // a cancel routinely races a just-completed connect and the
+                        // disable comes back `UNKNOWN_ADVERTISING_IDENTIFIER` (0x42).
+                        //
+                        // Propagating that with `?` was doubly fatal: it killed the
+                        // whole host runner, AND it skipped `canceled()` below, so the
+                        // pending-cancel state stayed set — the restarted runner
+                        // immediately re-issued the same doomed disable and died
+                        // again, wedging BLE in a restart loop with the device no
+                        // longer advertising (HW-observed on nRF52840 under
+                        // `ble_reconnect_flood`; only a reset cleared it).
+                        //
+                        // Mirror the `Connect` arm above: log, do NOT propagate, and
+                        // ALWAYS clear the state so nobody is left stuck.
+                        let res = if ext {
+                            host.command(LeSetExtAdvEnable::new(false, &[])).await
                         } else {
-                            host.command(LeSetAdvEnable::new(false)).await?
+                            host.command(LeSetAdvEnable::new(false)).await
+                        };
+                        if let Err(err) = res {
+                            warn!("[host] error disabling advertising: {:?}", err);
                         }
+                        // Signal to ensure no one is stuck
                         host.state.advertise_command_state.canceled();
                     }
                     CancelledCommandState::Scan(ext) => {
                         trace!("[host] disabling scanning");
-                        if ext {
+                        // Same reasoning as the Advertise arm above: cancelling a scan
+                        // that is already stopped is success, and propagating the error
+                        // here would both kill the runner and leave the pending-cancel
+                        // state set (an identical restart-loop wedge). Log + always
+                        // clear.
+                        let res = if ext {
                             // TODO: A bit opinionated but not more than before
                             host.command(LeSetExtScanEnable::new(
                                 false,
@@ -1914,10 +1940,14 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                                 bt_hci::param::Duration::from_secs(0),
                                 bt_hci::param::Duration::from_secs(0),
                             ))
-                            .await?;
+                            .await
                         } else {
-                            host.command(LeSetScanEnable::new(false, false)).await?;
+                            host.command(LeSetScanEnable::new(false, false)).await
+                        };
+                        if let Err(err) = res {
+                            warn!("[host] error disabling scanning: {:?}", err);
                         }
+                        // Signal to ensure no one is stuck
                         host.state.scan_command_state.canceled();
                     }
                     #[cfg(feature = "security")]
