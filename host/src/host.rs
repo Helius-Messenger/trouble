@@ -2084,23 +2084,39 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                             host.command(LeSetAdvEnable::new(false)).await.map(drop)
                         };
                         match result {
+                            Ok(()) => {}
                             // Disabling legacy advertising that is already disabled has no effect
                             // (Bluetooth Core v6.2, Vol 4, Part E, §7.8.9), but a controller may
-                            // still report "Command Disallowed" for it. That is benign, and must
-                            // not stop the runner: the disable also runs after every accepted
-                            // legacy advertising connection. For extended advertising, a rejected
-                            // disable can leave sets active, so the error is not tolerated there.
+                            // still report "Command Disallowed" for it. That is benign: the disable
+                            // also runs after every accepted legacy advertising connection.
                             Err(BleHostError::BleHost(Error::Hci(bt_hci::param::Error::CMD_DISALLOWED))) if !ext => {}
-                            // Any other failure is a real error: stop the runner with the original
-                            // error, like before the command state went through the cancel path.
-                            other => other?,
+                            // Any other failure: log, do NOT propagate, and ALWAYS clear the state
+                            // below. The controller auto-stops advertising when a connection is
+                            // established, so under connect/disconnect churn a cancel routinely
+                            // races a just-completed connect and the disable comes back e.g.
+                            // `UNKNOWN_ADVERTISING_IDENTIFIER` (0x42). Propagating it with `?` was
+                            // doubly fatal: it killed the whole host runner, AND it skipped
+                            // `canceled()`, so the pending-cancel state stayed set — the restarted
+                            // runner immediately re-issued the same doomed disable and died again,
+                            // wedging BLE in a restart loop with the device no longer advertising
+                            // (HW-observed on nRF52840 under `ble_reconnect_flood`; only a reset
+                            // cleared it). Mirror the `Connect` arm above.
+                            Err(err) => {
+                                warn!("[host] error disabling advertising: {:?}", err);
+                            }
                         }
+                        // Signal to ensure no one is stuck
                         host.state.advertise_command_state.canceled();
                     }
                     #[cfg(feature = "scan")]
                     CancelledCommandState::Scan(ext) => {
                         trace!("[host] disabling scanning");
-                        if ext {
+                        // Same reasoning as the Advertise arm above: cancelling a scan
+                        // that is already stopped is success, and propagating the error
+                        // here would both kill the runner and leave the pending-cancel
+                        // state set (an identical restart-loop wedge). Log + always
+                        // clear.
+                        let res = if ext {
                             // TODO: A bit opinionated but not more than before
                             host.command(LeSetExtScanEnable::new(
                                 false,
@@ -2108,10 +2124,14 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                                 bt_hci::param::Duration::from_secs(0),
                                 bt_hci::param::Duration::from_secs(0),
                             ))
-                            .await?;
+                            .await
                         } else {
-                            host.command(LeSetScanEnable::new(false, false)).await?;
+                            host.command(LeSetScanEnable::new(false, false)).await
+                        };
+                        if let Err(err) = res {
+                            warn!("[host] error disabling scanning: {:?}", err);
                         }
+                        // Signal to ensure no one is stuck
                         host.state.scan_command_state.canceled();
                     }
                     #[cfg(feature = "security")]
