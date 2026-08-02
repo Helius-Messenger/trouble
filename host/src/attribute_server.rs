@@ -41,6 +41,24 @@ impl Client {
     fn set_identity(&mut self, identity: Identity) {
         self.identity = identity;
     }
+
+    /// Does this slot belong to the live connection `handle`?
+    ///
+    /// Handle FIRST, identity only as a fallback. A peer's identity is not
+    /// stable across a link — it is the raw connection address until the link
+    /// encrypts and the bonded identity afterwards — so an identity-only match
+    /// silently stopped resolving the moment a peer bonded. Every CCCD lookup
+    /// then missed for that connection, and since `notify_raw` treats a miss as
+    /// success, the peer went silently deaf mid-link with no error anywhere.
+    /// The handle is controller-assigned and constant for the whole link.
+    fn owns(&self, handle: ConnHandle, peer_identity: &Identity) -> bool {
+        match self.handle {
+            Some(h) => h == handle,
+            // Claimed before handles were tracked (or already disconnected):
+            // fall back to identity so a bonded peer still finds its CCCDs.
+            None => self.identity.match_identity(peer_identity),
+        }
+    }
 }
 
 /// A GATT server capable of processing the GATT protocol using the provided table of attributes.
@@ -119,7 +137,7 @@ impl<M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: usize> se
             .with_attribute(att_handle, |att| {
                 if matches!(att.data, AttributeData::ClientSpecific { .. }) {
                     self.client_att_tables
-                        .read(&connection.peer_identity(), att_handle, 0, buf)
+                        .read(connection.handle(), &connection.peer_identity(), att_handle, 0, buf)
                 } else {
                     att.read(0, buf)
                 }
@@ -138,7 +156,7 @@ impl<M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: usize> se
                     })
                 } else if matches!(att.data, AttributeData::ClientSpecific { .. }) {
                     self.client_att_tables
-                        .write(&connection.peer_identity(), att_handle, 0, input)
+                        .write(connection.handle(), &connection.peer_identity(), att_handle, 0, input)
                         .map_err(Into::into)
                 } else {
                     att.write(0, input).map_err(Into::into)
@@ -199,7 +217,7 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
 
     pub(crate) fn should_notify(&self, connection: &Connection<'_, P>, cccd_handle: u16) -> bool {
         self.client_att_tables
-            .with_value(&connection.peer_identity(), cccd_handle, |value| {
+            .with_value(connection.handle(), &connection.peer_identity(), cccd_handle, |value| {
                 if let Ok(value) = value.try_into() {
                     CCCD(u16::from_le_bytes(value)).should_notify()
                 } else {
@@ -211,7 +229,7 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
 
     pub(crate) fn should_indicate(&self, connection: &Connection<'_, P>, cccd_handle: u16) -> bool {
         self.client_att_tables
-            .with_value(&connection.peer_identity(), cccd_handle, |value| {
+            .with_value(connection.handle(), &connection.peer_identity(), cccd_handle, |value| {
                 if let Ok(value) = value.try_into() {
                     CCCD(u16::from_le_bytes(value)).should_indicate()
                 } else {
@@ -255,7 +273,7 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
         if matches!(att.data, AttributeData::ClientSpecific { .. }) {
             return self
                 .client_att_tables
-                .read(&connection.peer_identity(), handle, offset, data);
+                .read(connection.handle(), &connection.peer_identity(), handle, offset, data);
         }
         att.read(offset, data)
     }
@@ -272,7 +290,7 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
         if matches!(att.data, AttributeData::ClientSpecific { .. }) {
             return self
                 .client_att_tables
-                .write(&connection.peer_identity(), handle, offset, data);
+                .write(connection.handle(), &connection.peer_identity(), handle, offset, data);
         }
         att.write(offset, data)
     }
