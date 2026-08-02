@@ -1,3 +1,4 @@
+use bt_hci::param::ConnHandle;
 use core::marker::PhantomData;
 
 use embassy_sync::blocking_mutex::raw::RawMutex;
@@ -19,6 +20,21 @@ mod client_att_table;
 struct Client {
     identity: Identity,
     is_connected: bool,
+    /// Connection handle that currently owns this slot.
+    ///
+    /// The slot's LIFETIME is keyed on this, not on [`Client::identity`].
+    /// A peer's identity is not stable across a link: it starts as the raw
+    /// connection address and becomes the bonded identity once the link is
+    /// encrypted (and an RPA-using peer rotates its address besides). Keying
+    /// `disconnect()` on identity therefore silently failed to match whenever
+    /// the identity had moved, so `is_connected` was never cleared and the slot
+    /// leaked as "connected" forever. The connection handle is assigned by the
+    /// controller, is unique among live links, and is byte-identical at connect
+    /// and disconnect — so keying on it makes that leak impossible.
+    handle: Option<ConnHandle>,
+    /// Monotonic claim counter, used to pick the LEAST-RECENTLY-CLAIMED slot
+    /// when a reclaim is unavoidable (see `ClientAttTables::connect`).
+    seq: u32,
 }
 
 impl Client {
@@ -77,7 +93,8 @@ impl<M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: usize> se
         #[cfg(not(feature = "security"))]
         let bonded = false;
 
-        self.client_att_tables.disconnect(&connection.peer_identity(), bonded);
+        self.client_att_tables
+            .disconnect(connection.handle(), &connection.peer_identity(), bonded);
     }
 
     fn process(
@@ -176,7 +193,8 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
     }
 
     pub(crate) fn connect(&self, connection: &Connection<'_, P>) -> Result<(), Error> {
-        self.client_att_tables.connect(&connection.peer_identity())
+        self.client_att_tables
+            .connect(connection.handle(), &connection.peer_identity())
     }
 
     pub(crate) fn should_notify(&self, connection: &Connection<'_, P>, cccd_handle: u16) -> bool {

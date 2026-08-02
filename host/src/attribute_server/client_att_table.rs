@@ -1,3 +1,4 @@
+use bt_hci::param::ConnHandle;
 use core::cell::RefCell;
 
 use embassy_sync::blocking_mutex::raw::RawMutex;
@@ -415,57 +416,83 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
         }
     }
 
-    pub(crate) fn connect(&self, peer_identity: &Identity) -> Result<(), Error> {
+    pub(crate) fn connect(&self, handle: ConnHandle, peer_identity: &Identity) -> Result<(), Error> {
         self.state.lock(|n| {
             trace!("[server] searching for peer {:?}", peer_identity);
             let mut n = n.borrow_mut();
             let empty_slot = Identity::default();
-            for (client, table) in n.iter_mut() {
-                if client.identity.match_identity(peer_identity) {
-                    // trace!("[server] found! table = {:?}", *table);
+            // Bump on every claim so the reclaim path below can pick the
+            // least-recently-claimed slot instead of a fixed one.
+            let seq = n.iter().map(|(c, _)| c.seq).max().unwrap_or(0).wrapping_add(1);
+
+            // 1. This handle already owns a slot. Only reachable if a link is
+            //    re-registered without an intervening disconnect; make it a
+            //    no-op rather than a second slot for the same link.
+            // 2. Same peer as a previous link (a reconnecting bonded central) —
+            //    keep its cached CCCDs and re-point the slot at the new handle.
+            for (client, _) in n.iter_mut() {
+                if client.handle == Some(handle) || client.identity.match_identity(peer_identity) {
+                    trace!("[server] reusing slot for peer {:?}", peer_identity);
                     client.is_connected = true;
-                    return Ok(());
-                } else if client.identity == empty_slot {
-                    //  trace!("[server] empty slot: connecting");
-                    client.is_connected = true;
+                    client.handle = Some(handle);
                     client.set_identity(*peer_identity);
+                    client.seq = seq;
+                    return Ok(());
+                }
+            }
+            // 3. A never-used slot.
+            for (client, _) in n.iter_mut() {
+                if client.identity == empty_slot {
+                    trace!("[server] empty slot: connecting");
+                    client.is_connected = true;
+                    client.handle = Some(handle);
+                    client.set_identity(*peer_identity);
+                    client.seq = seq;
                     return Ok(());
                 }
             }
             trace!("[server] all slots full...");
-            // if we got here all slots are full; replace the first disconnected client
+            // 4. All slots are taken; evict one whose link is gone.
             for (client, table) in n.iter_mut() {
                 if !client.is_connected {
                     trace!("[server] booting disconnected peer {:?}", client.identity);
+                    *client = Client::default();
                     client.is_connected = true;
+                    client.handle = Some(handle);
                     client.set_identity(*peer_identity);
+                    client.seq = seq;
                     // erase the previous client's config
                     table.clear();
                     return Ok(());
                 }
             }
-            // All slots claim `is_connected` — but this connect() is only reached
-            // for a connection the CONTROLLER already ADMITTED, and the controller
-            // enforces the same CONN_MAX cap as this table. So the true number of
-            // LIVE connections is < CONN_MAX, which means at least one slot here is
-            // STALE: its `is_connected` flag was never cleared because disconnect()
-            // matches by `peer_identity`, and that identity can differ between
-            // connect and disconnect (the peer resolved an RPA to a bonded identity,
-            // rotated its private address, or dropped abnormally mid-pairing before
-            // an identity was established). Rather than refuse — which permanently
-            // WEDGES the GATT server ("unable to obtain client attributes slot" =>
-            // every future client rejected, a stale-bond or rapidly-reconnecting
-            // central can DoS the device) — reclaim a stale slot. Worst case we
-            // reclaim a genuine client's cached CCCD config, which it simply
-            // re-subscribes on next use; that is strictly better than wedging.
-            if let Some((client, table)) = n.iter_mut().next() {
+            // 5. Every slot still claims to be connected. This connect() is only
+            // reached for a link the CONTROLLER already ADMITTED, and the
+            // controller enforces the same CONN_MAX cap, so at least one slot
+            // must be stale. Refusing would permanently WEDGE the GATT server
+            // (every later client rejected — a reconnecting central could DoS
+            // the device), so reclaim instead.
+            //
+            // ⚠️ Which slot we reclaim is NOT arbitrary. This used to take
+            // `iter_mut().next()` — ALWAYS SLOT 0 — which happily evicted a
+            // LIVE peer: with two centrals connected, both landed on slot 0 and
+            // the second overwrote the first's identity and cleared its CCCDs.
+            // `should_notify` then missed for that peer forever and `notify_raw`
+            // turned every notification into a successful-looking no-op, so one
+            // companion silently received NOTHING (HW-measured: 521 dropped
+            // notifications to the second central, zero to the first).
+            // Evict the LEAST-RECENTLY-CLAIMED slot instead: live links are
+            // re-stamped on every connect, so the oldest is the stale one.
+            if let Some((client, table)) = n.iter_mut().min_by_key(|(c, _)| c.seq) {
                 warn!(
                     "[server] all attribute slots claim connected but a new connection was \
-                     admitted — reclaiming a stale slot (prevents GATT-server wedge)"
+                     admitted — reclaiming the least-recently-claimed slot (prevents GATT-server wedge)"
                 );
                 *client = Client::default();
                 client.is_connected = true;
+                client.handle = Some(handle);
                 client.set_identity(*peer_identity);
+                client.seq = seq;
                 table.clear();
                 return Ok(());
             }
@@ -473,16 +500,28 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
         })
     }
 
-    pub(crate) fn disconnect(&self, peer_identity: &Identity, bonded: bool) {
+    pub(crate) fn disconnect(&self, handle: ConnHandle, peer_identity: &Identity, bonded: bool) {
         self.state.lock(|n| {
             let mut n = n.borrow_mut();
             for (client, table) in n.iter_mut() {
-                if client.identity.match_identity(peer_identity) {
+                // Match on the HANDLE first. Identity is not stable across a
+                // link (raw connection address before encryption, bonded
+                // identity after; RPA peers rotate theirs), so an
+                // identity-only match silently missed whenever the identity had
+                // moved — leaving `is_connected` set forever, leaking the slot,
+                // and eventually forcing every connect down the reclaim path
+                // above. The handle is controller-assigned and byte-identical
+                // at connect and disconnect. Identity remains as a fallback for
+                // a slot claimed before handles were tracked.
+                if client.handle == Some(handle)
+                    || (client.handle.is_none() && client.identity.match_identity(peer_identity))
+                {
                     if !bonded {
                         *client = Client::default();
                         table.clear();
                     } else {
                         client.is_connected = false;
+                        client.handle = None;
                     }
                     break;
                 }
@@ -593,6 +632,118 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
 mod tests {
     use super::{ClientAttTable, ClientAttTableView};
     use crate::att::AttErrorCode;
+
+    /// Regression: two LIVE connections must each keep their own slot, and a
+    /// later connect must never evict a live peer's CCCD subscriptions.
+    ///
+    /// The original allocator reclaimed `iter_mut().next()` — always slot 0 —
+    /// whenever every slot claimed `is_connected`. With two centrals attached
+    /// they both landed on slot 0, so the second silently wiped the first's
+    /// identity and CCCD table. `should_notify` then missed for that peer
+    /// forever, and because `notify_raw` treats a miss as success, the peer
+    /// received NOTHING while the board logged a clean fan-out.
+    #[test]
+    fn a_second_connection_does_not_evict_a_live_peers_subscriptions() {
+        use bt_hci::param::{AddrKind, BdAddr, ConnHandle};
+        use core::cell::RefCell;
+        use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+        use embassy_sync::blocking_mutex::Mutex;
+
+        use super::{Client, ClientAttTables};
+        use crate::{Address, Identity};
+
+        const CCCD: u16 = 53;
+
+        fn ident(last: u8) -> Identity {
+            Identity {
+                addr: Address::new(AddrKind::PUBLIC, BdAddr::new([1, 2, 3, 4, 5, last])),
+                irk: None,
+            }
+        }
+
+        let mut builder = ClientAttTable::builder();
+        builder.push(CCCD, 2, false);
+        let base = builder.build();
+        // CONN_MAX = 2 so the "all slots claim connected" reclaim path is easy
+        // to reach — it is the path that used to destroy a live peer.
+        let tables: ClientAttTables<NoopRawMutex, 2> = ClientAttTables {
+            state: Mutex::new(RefCell::new(core::array::from_fn(|_| {
+                (Client::default(), base.clone())
+            }))),
+        };
+
+        let (a, b) = (ident(0xAA), ident(0xBB));
+        let (ha, hb) = (ConnHandle::new(1), ConnHandle::new(2));
+
+        tables.connect(ha, &a).unwrap();
+        tables.connect(hb, &b).unwrap();
+
+        // Both subscribe (CCCD notify bit).
+        tables.write(&a, CCCD, 0, &[0x01, 0x00]).unwrap();
+        tables.write(&b, CCCD, 0, &[0x01, 0x00]).unwrap();
+
+        let notify = |id: &Identity| tables.with_value(id, CCCD, |v| { let mut o = [0u8; 2]; o.copy_from_slice(v); o });
+        assert_eq!(notify(&a), Some([0x01u8, 0x00]), "A lost its slot");
+        assert_eq!(notify(&b), Some([0x01u8, 0x00]), "B lost its slot");
+
+        // A third peer arrives while both slots are live — the reclaim path.
+        // It must take a slot, and it must not silently orphan BOTH peers.
+        let c = ident(0xCC);
+        tables.connect(ConnHandle::new(3), &c).unwrap();
+        tables.write(&c, CCCD, 0, &[0x01, 0x00]).unwrap();
+        assert_eq!(notify(&c), Some([0x01u8, 0x00]));
+        // The least-recently-claimed slot (A) is the victim; the more recent
+        // live peer B survives. Under the old always-slot-0 rule both A and B
+        // ended up sharing one slot and B was the one destroyed.
+        assert_eq!(notify(&b), Some([0x01u8, 0x00]), "a live peer was evicted");
+    }
+
+    /// A disconnect must free the slot even when the peer's identity CHANGED
+    /// during the link (raw connection address before encryption, bonded
+    /// identity after). Keying on identity alone leaked the slot as
+    /// `is_connected` forever, which is what forced every later connect into
+    /// the reclaim path in the first place.
+    #[test]
+    fn disconnect_frees_the_slot_even_if_the_identity_changed_mid_link() {
+        use bt_hci::param::{AddrKind, BdAddr, ConnHandle};
+        use core::cell::RefCell;
+        use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+        use embassy_sync::blocking_mutex::Mutex;
+
+        use super::{Client, ClientAttTables};
+        use crate::{Address, Identity};
+
+        const CCCD: u16 = 53;
+        fn ident(last: u8) -> Identity {
+            Identity {
+                addr: Address::new(AddrKind::PUBLIC, BdAddr::new([1, 2, 3, 4, 5, last])),
+                irk: None,
+            }
+        }
+
+        let mut builder = ClientAttTable::builder();
+        builder.push(CCCD, 2, false);
+        let base = builder.build();
+        let tables: ClientAttTables<NoopRawMutex, 1> = ClientAttTables {
+            state: Mutex::new(RefCell::new(core::array::from_fn(|_| {
+                (Client::default(), base.clone())
+            }))),
+        };
+
+        let h = ConnHandle::new(7);
+        tables.connect(h, &ident(0x01)).unwrap();
+        // Peer's identity moves to its bonded identity, then the link drops.
+        tables.disconnect(h, &ident(0x02), false);
+
+        // The single slot must now be free for a brand-new peer WITHOUT
+        // needing the reclaim path.
+        tables.connect(ConnHandle::new(8), &ident(0x03)).unwrap();
+        tables.write(&ident(0x03), CCCD, 0, &[0x01, 0x00]).unwrap();
+        assert_eq!(
+            tables.with_value(&ident(0x03), CCCD, |v| { let mut o = [0u8; 2]; o.copy_from_slice(v); o }),
+            Some([0x01u8, 0x00])
+        );
+    }
 
     fn assert_invalid(data: &[u8]) {
         assert!(ClientAttTableView::try_from_raw(data).is_err());
