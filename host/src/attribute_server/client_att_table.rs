@@ -428,21 +428,48 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
             // 1. This handle already owns a slot. Only reachable if a link is
             //    re-registered without an intervening disconnect; make it a
             //    no-op rather than a second slot for the same link.
-            // 2. Same peer as a previous link (a reconnecting bonded central) —
-            //    keep its cached CCCDs and re-point the slot at the new handle.
             for (client, _) in n.iter_mut() {
-                if client.handle == Some(handle) || client.identity.match_identity(peer_identity) {
-                    trace!("[server] reusing slot for peer {:?}", peer_identity);
+                if client.handle == Some(handle) {
+                    trace!("[server] slot already held by this link");
                     client.is_connected = true;
-                    client.handle = Some(handle);
                     client.set_identity(*peer_identity);
                     client.seq = seq;
                     return Ok(());
                 }
             }
+            // 2. Same peer as a PREVIOUS link (a reconnecting bonded central) —
+            //    keep its cached CCCDs and re-point the slot at the new handle.
+            //
+            //    ⚠️ Two guards, both load-bearing:
+            //    * `handle.is_none()` — a slot owned by a LIVE link must never
+            //      be stolen on an identity match, or the peer that owned it is
+            //      silently orphaned.
+            //    * `!peer_identity.is_unset()` — a connection reports the
+            //      DEFAULT identity until its link encrypts, and
+            //      `Identity::default().match_identity(&default)` is TRUE. So
+            //      without this, every not-yet-encrypted connection matched
+            //      every other one and they all collapsed onto a single slot;
+            //      the last to connect took it and the rest were left with no
+            //      slot at all. Their CCCD writes then failed with ATT
+            //      `Attribute Not Found (0x0a)` and they never received a single
+            //      notification. HW-measured with two centrals: 28 CCCD writes,
+            //      28 × 0x0a, 0 notifications on the orphaned link, while the
+            //      other link wrote the SAME handles with 0 errors.
+            if !peer_identity.is_unset() {
+                for (client, _) in n.iter_mut() {
+                    if client.handle.is_none() && client.identity.match_identity(peer_identity) {
+                        trace!("[server] reusing slot for peer {:?}", peer_identity);
+                        client.is_connected = true;
+                        client.handle = Some(handle);
+                        client.set_identity(*peer_identity);
+                        client.seq = seq;
+                        return Ok(());
+                    }
+                }
+            }
             // 3. A never-used slot.
             for (client, _) in n.iter_mut() {
-                if client.identity == empty_slot {
+                if client.handle.is_none() && client.identity == empty_slot {
                     trace!("[server] empty slot: connecting");
                     client.is_connected = true;
                     client.handle = Some(handle);
@@ -706,6 +733,54 @@ mod tests {
         // live peer B survives. Under the old always-slot-0 rule both A and B
         // ended up sharing one slot and B was the one destroyed.
         assert_eq!(notify(hb, &b), Some([0x01u8, 0x00]), "a live peer was evicted");
+    }
+
+    /// Regression: two connections that have not yet encrypted BOTH report the
+    /// DEFAULT identity, and `Identity::default().match_identity(&default)` is
+    /// true — so an identity-keyed reuse collapsed them onto ONE slot. The
+    /// second to connect took it; the first was left with no slot at all, its
+    /// CCCD writes were rejected with ATT `Attribute Not Found (0x0a)`, and it
+    /// never received a single notification.
+    #[test]
+    fn two_unresolved_connections_do_not_collapse_onto_one_slot() {
+        use bt_hci::param::ConnHandle;
+        use core::cell::RefCell;
+        use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+        use embassy_sync::blocking_mutex::Mutex;
+
+        use super::{Client, ClientAttTables};
+        use crate::Identity;
+
+        const CCCD: u16 = 53;
+        let mut builder = ClientAttTable::builder();
+        builder.push(CCCD, 2, false);
+        let base = builder.build();
+        let tables: ClientAttTables<NoopRawMutex, 2> = ClientAttTables {
+            state: Mutex::new(RefCell::new(core::array::from_fn(|_| {
+                (Client::default(), base.clone())
+            }))),
+        };
+
+        // Neither link has encrypted yet, so both report the default identity.
+        let unset = Identity::default();
+        let (h1, h2) = (ConnHandle::new(1), ConnHandle::new(2));
+        tables.connect(h1, &unset).unwrap();
+        tables.connect(h2, &unset).unwrap();
+
+        // BOTH must be able to subscribe — this is the write that used to fail
+        // with ATTRIBUTE_NOT_FOUND for whichever link lost the race.
+        tables.write(h1, &unset, CCCD, 0, &[0x01, 0x00]).unwrap();
+        tables.write(h2, &unset, CCCD, 0, &[0x01, 0x00]).unwrap();
+
+        let notify = |h| {
+            tables.with_value(h, &unset, CCCD, |v| {
+                let mut o = [0u8; 2];
+                o.copy_from_slice(v);
+                o
+            })
+        };
+        assert_eq!(notify(h1), Some([0x01u8, 0x00]), "link 1 was orphaned");
+        assert_eq!(notify(h2), Some([0x01u8, 0x00]), "link 2 was orphaned");
     }
 
     /// A disconnect must free the slot even when the peer's identity CHANGED
