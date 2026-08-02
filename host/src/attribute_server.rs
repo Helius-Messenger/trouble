@@ -56,7 +56,9 @@ impl Client {
             Some(h) => h == handle,
             // Claimed before handles were tracked (or already disconnected):
             // fall back to identity so a bonded peer still finds its CCCDs.
-            None => self.identity.match_identity(peer_identity),
+            // Never on an UNSET identity — the default matches the default, so
+            // that would hand an unresolved connection someone else's slot.
+            None => !peer_identity.is_unset() && self.identity.match_identity(peer_identity),
         }
     }
 }
