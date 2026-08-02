@@ -531,6 +531,7 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
 
     pub(crate) fn with_value<R>(
         &self,
+        handle: ConnHandle,
         peer_identity: &Identity,
         att_handle: u16,
         f: impl FnOnce(&[u8]) -> R,
@@ -538,7 +539,7 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
         self.state.lock(|n| {
             let n = n.borrow();
             for (client, table) in n.iter() {
-                if client.identity.match_identity(peer_identity) {
+                if client.owns(handle, peer_identity) {
                     return table.get(att_handle).map(f);
                 }
             }
@@ -548,6 +549,7 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
 
     pub(crate) fn read(
         &self,
+        handle: ConnHandle,
         peer_identity: &Identity,
         att_handle: u16,
         offset: usize,
@@ -556,7 +558,7 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
         self.state.lock(|n| {
             let n = n.borrow();
             for (client, table) in n.iter() {
-                if client.identity.match_identity(peer_identity) {
+                if client.owns(handle, peer_identity) {
                     let value = table.get(att_handle).ok_or(AttErrorCode::ATTRIBUTE_NOT_FOUND)?;
                     if offset > value.len() {
                         return Err(AttErrorCode::INVALID_OFFSET);
@@ -573,6 +575,7 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
 
     pub(crate) fn write(
         &self,
+        handle: ConnHandle,
         peer_identity: &Identity,
         att_handle: u16,
         offset: usize,
@@ -581,7 +584,7 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
         self.state.lock(|n| {
             let mut n = n.borrow_mut();
             for (client, table) in n.iter_mut() {
-                if client.identity.match_identity(peer_identity) {
+                if client.owns(handle, peer_identity) {
                     return table.write(att_handle, offset, data);
                 }
             }
@@ -679,23 +682,30 @@ mod tests {
         tables.connect(hb, &b).unwrap();
 
         // Both subscribe (CCCD notify bit).
-        tables.write(&a, CCCD, 0, &[0x01, 0x00]).unwrap();
-        tables.write(&b, CCCD, 0, &[0x01, 0x00]).unwrap();
+        tables.write(ha, &a, CCCD, 0, &[0x01, 0x00]).unwrap();
+        tables.write(hb, &b, CCCD, 0, &[0x01, 0x00]).unwrap();
 
-        let notify = |id: &Identity| tables.with_value(id, CCCD, |v| { let mut o = [0u8; 2]; o.copy_from_slice(v); o });
-        assert_eq!(notify(&a), Some([0x01u8, 0x00]), "A lost its slot");
-        assert_eq!(notify(&b), Some([0x01u8, 0x00]), "B lost its slot");
+        let notify = |h, id: &Identity| {
+            tables.with_value(h, id, CCCD, |v| {
+                let mut o = [0u8; 2];
+                o.copy_from_slice(v);
+                o
+            })
+        };
+        assert_eq!(notify(ha, &a), Some([0x01u8, 0x00]), "A lost its slot");
+        assert_eq!(notify(hb, &b), Some([0x01u8, 0x00]), "B lost its slot");
 
         // A third peer arrives while both slots are live — the reclaim path.
         // It must take a slot, and it must not silently orphan BOTH peers.
         let c = ident(0xCC);
-        tables.connect(ConnHandle::new(3), &c).unwrap();
-        tables.write(&c, CCCD, 0, &[0x01, 0x00]).unwrap();
-        assert_eq!(notify(&c), Some([0x01u8, 0x00]));
+        let hc = ConnHandle::new(3);
+        tables.connect(hc, &c).unwrap();
+        tables.write(hc, &c, CCCD, 0, &[0x01, 0x00]).unwrap();
+        assert_eq!(notify(hc, &c), Some([0x01u8, 0x00]));
         // The least-recently-claimed slot (A) is the victim; the more recent
         // live peer B survives. Under the old always-slot-0 rule both A and B
         // ended up sharing one slot and B was the one destroyed.
-        assert_eq!(notify(&b), Some([0x01u8, 0x00]), "a live peer was evicted");
+        assert_eq!(notify(hb, &b), Some([0x01u8, 0x00]), "a live peer was evicted");
     }
 
     /// A disconnect must free the slot even when the peer's identity CHANGED
@@ -737,11 +747,33 @@ mod tests {
 
         // The single slot must now be free for a brand-new peer WITHOUT
         // needing the reclaim path.
-        tables.connect(ConnHandle::new(8), &ident(0x03)).unwrap();
-        tables.write(&ident(0x03), CCCD, 0, &[0x01, 0x00]).unwrap();
+        let h2 = ConnHandle::new(8);
+        tables.connect(h2, &ident(0x03)).unwrap();
+        tables.write(h2, &ident(0x03), CCCD, 0, &[0x01, 0x00]).unwrap();
         assert_eq!(
-            tables.with_value(&ident(0x03), CCCD, |v| { let mut o = [0u8; 2]; o.copy_from_slice(v); o }),
+            tables.with_value(h2, &ident(0x03), CCCD, |v| {
+                let mut o = [0u8; 2];
+                o.copy_from_slice(v);
+                o
+            }),
             Some([0x01u8, 0x00])
+        );
+
+        // ⭐ And the lookup must keep resolving when the peer's identity moves
+        // MID-LINK (raw connection address -> bonded identity on encryption).
+        // Matching CCCDs by identity alone made the slot unreachable at that
+        // instant: the CCCD write landed under one identity and every later
+        // `should_notify` looked up the other, missed, and — because a miss is
+        // reported as a successful no-op — the peer went silently deaf.
+        // HW-measured: the second central of two received NOTHING.
+        assert_eq!(
+            tables.with_value(h2, &ident(0x99), CCCD, |v| {
+                let mut o = [0u8; 2];
+                o.copy_from_slice(v);
+                o
+            }),
+            Some([0x01u8, 0x00]),
+            "slot became unreachable after the peer identity changed mid-link"
         );
     }
 
