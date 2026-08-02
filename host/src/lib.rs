@@ -261,6 +261,17 @@ impl Identity {
         false
     }
 
+    /// Is this identity still the placeholder default (no peer resolved yet)?
+    ///
+    /// A connection reports the default `Identity` until its link encrypts, and
+    /// `Identity::default().match_identity(&Identity::default())` is TRUE
+    /// (equal addresses). Any table keyed on identity must therefore refuse to
+    /// match an unset one, or every not-yet-encrypted connection matches every
+    /// other one.
+    pub fn is_unset(&self) -> bool {
+        *self == Identity::default()
+    }
+
     /// Check whether the given identity matches current identity
     pub fn match_identity(&self, identity: &Identity) -> bool {
         if self.addr == identity.addr {
