@@ -543,13 +543,23 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
                 if client.handle == Some(handle)
                     || (client.handle.is_none() && client.identity.match_identity(peer_identity))
                 {
-                    if !bonded {
-                        *client = Client::default();
-                        table.clear();
-                    } else {
-                        client.is_connected = false;
-                        client.handle = None;
-                    }
+                    // Release the LINK but KEEP the cached CCCDs, bonded or not.
+                    //
+                    // Wiping an unbonded peer's slot here looked spec-tidy but
+                    // punishes the common case: a link that drops before (or
+                    // while) its bond state is evaluated reads as unbonded, so
+                    // an ordinary reconnect came back to a PRISTINE slot and the
+                    // companion was left silently unsubscribed. Clear LAZILY
+                    // instead — when a DIFFERENT peer actually reuses the slot
+                    // (paths 4/5 in `connect`). That is equally correct for an
+                    // unbonded client and cannot punish a reconnect.
+                    //
+                    // Invisible while the table had a single slot: every
+                    // connection resolved to it and so always found the previous
+                    // CCCDs, however wrong the accounting was.
+                    let _ = bonded;
+                    client.is_connected = false;
+                    client.handle = None;
                     break;
                 }
             }
