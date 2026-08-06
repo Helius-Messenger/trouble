@@ -218,7 +218,8 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
     }
 
     pub(crate) fn should_notify(&self, connection: &Connection<'_, P>, cccd_handle: u16) -> bool {
-        self.client_att_tables
+        let notify = self
+            .client_att_tables
             .with_value(connection.handle(), &connection.peer_identity(), cccd_handle, |value| {
                 if let Ok(value) = value.try_into() {
                     CCCD(u16::from_le_bytes(value)).should_notify()
@@ -226,7 +227,25 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
                     false
                 }
             })
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if !notify {
+            // CCCDDIAG: `unwrap_or(false)` collapses three very different states
+            // into one — no slot owns this link, the slot has no value for this
+            // CCCD, or the value really says "don't notify". A peripheral that
+            // ACKs a CCCD enable and then never notifies is indistinguishable
+            // from an unsubscribed peer without this split.
+            let (slot, has_value) =
+                self.client_att_tables
+                    .diag_lookup(connection.handle(), &connection.peer_identity(), cccd_handle);
+            warn!(
+                "[server] CCCDDIAG no-notify conn={} cccd={} slot_owned={} has_value={}",
+                connection.handle().raw(),
+                cccd_handle,
+                slot,
+                has_value,
+            );
+        }
+        notify
     }
 
     pub(crate) fn should_indicate(&self, connection: &Connection<'_, P>, cccd_handle: u16) -> bool {
