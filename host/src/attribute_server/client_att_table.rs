@@ -629,6 +629,28 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
         })
     }
 
+    /// CCCDDIAG: does ANY slot own this link, and does that slot hold a value
+    /// for `att_handle`? `should_notify` collapses both misses into `false`,
+    /// which makes "nobody is subscribed" indistinguishable from "the slot that
+    /// held the subscription is gone" — the exact ambiguity behind a peripheral
+    /// that ACKs a CCCD enable and then never notifies.
+    pub(crate) fn diag_lookup(
+        &self,
+        handle: ConnHandle,
+        peer_identity: &Identity,
+        att_handle: u16,
+    ) -> (bool, bool) {
+        self.state.lock(|n| {
+            let n = n.borrow();
+            for (client, table) in n.iter() {
+                if client.owns(handle, peer_identity) {
+                    return (true, table.get(att_handle).is_some());
+                }
+            }
+            (false, false)
+        })
+    }
+
     pub(crate) fn get_client_att_table(&self, peer_identity: &Identity) -> Option<ClientAttTable> {
         self.state.lock(|n| {
             let n = n.borrow();
