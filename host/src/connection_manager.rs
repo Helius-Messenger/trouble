@@ -938,8 +938,35 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                             warn!("Ignoring security channel packet after SMP timeout");
                             return Ok(());
                         } else if let Err(error) = self.security_manager.handle_l2cap_command(pdu, self, storage) {
-                            error!("Failed to handle security manager packet, {:?}", error);
-                            return Err(error);
+                            // FW-BLE-SMP-NONFATAL: a failed SMP command is a
+                            // per-PAIRING outcome, not a host-fatal condition. By
+                            // this point `handle_security_error` has already
+                            // answered the link with SMP PairingFailed and fired
+                            // the failure event — propagating the error further
+                            // KILLED THE WHOLE RUNNER ("BLE runner err —
+                            // restarting; err=BleHost(InvalidState)"), tearing
+                            // down every live connection because one peer sent a
+                            // late/duplicate SMP PDU after a pairing completed.
+                            // HW-measured on the nRF techo under connect churn:
+                            // pairing completes (security_level=Encrypted), a
+                            // trailing SMP PDU hits the now-idle SM →
+                            // InvalidState → runner restart → unsolicited drop of
+                            // ALL centrals + the kernel-side "unexpected SMP
+                            // command 0x05" spam as every retry loops the same
+                            // path. Mirrors the Connect/advertise-cancel arms:
+                            // log, keep the host alive.
+                            match error {
+                                Error::InvalidState | Error::Security(_) => {
+                                    warn!(
+                                        "SMP command failed ({:?}) — pairing-level failure, host continues",
+                                        error
+                                    );
+                                }
+                                _ => {
+                                    error!("Failed to handle security manager packet, {:?}", error);
+                                    return Err(error);
+                                }
+                            }
                         }
                         break;
                     }
