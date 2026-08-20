@@ -566,6 +566,33 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
         })
     }
 
+    /// FW-BLE-CCCD-SPLIT (2026-08-21): resolve WHICH slot a lookup should use,
+    /// preferring a LIVE handle match over the identity fallback.
+    ///
+    /// `owns()` alone is ambiguous when a stale slot (handle=None, bonded
+    /// identity kept for the CCCD cache) coexists with the live slot for a NEW
+    /// connection to the same peer: pre-pairing (identity unset) only the live
+    /// slot owns, so the CCCD-enable WRITE lands there; post-pairing the stale
+    /// slot's identity fallback also matches, and plain iteration order can
+    /// hand the notify READ the stale slot's old (disabled) value — the
+    /// HW-observed `CCCDDIAG no-notify slot_owned=true has_value=true` wedge
+    /// that stalled a 377 KB OTA push forever and cleared only on reset.
+    /// Two passes: any slot whose handle IS this connection wins outright;
+    /// only when none exists may an identity-matched (released) slot serve.
+    fn slot_index(
+        n: &[(Client, ClientAttTable); CONN_MAX],
+        handle: ConnHandle,
+        peer_identity: &Identity,
+    ) -> Option<usize> {
+        if let Some(i) = n
+            .iter()
+            .position(|(client, _)| client.handle == Some(handle))
+        {
+            return Some(i);
+        }
+        n.iter().position(|(client, _)| client.owns(handle, peer_identity))
+    }
+
     pub(crate) fn with_value<R>(
         &self,
         handle: ConnHandle,
@@ -575,12 +602,8 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
     ) -> Option<R> {
         self.state.lock(|n| {
             let n = n.borrow();
-            for (client, table) in n.iter() {
-                if client.owns(handle, peer_identity) {
-                    return table.get(att_handle).map(f);
-                }
-            }
-            None
+            Self::slot_index(&n, handle, peer_identity)
+                .and_then(|i| n[i].1.get(att_handle).map(f))
         })
     }
 
@@ -594,17 +617,16 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
     ) -> Result<usize, AttErrorCode> {
         self.state.lock(|n| {
             let n = n.borrow();
-            for (client, table) in n.iter() {
-                if client.owns(handle, peer_identity) {
-                    let value = table.get(att_handle).ok_or(AttErrorCode::ATTRIBUTE_NOT_FOUND)?;
-                    if offset > value.len() {
-                        return Err(AttErrorCode::INVALID_OFFSET);
-                    }
-                    let value = &value[offset..];
-                    let len = value.len().min(data.len());
-                    data[..len].copy_from_slice(value);
-                    return Ok(len);
+            if let Some(i) = Self::slot_index(&n, handle, peer_identity) {
+                let table = &n[i].1;
+                let value = table.get(att_handle).ok_or(AttErrorCode::ATTRIBUTE_NOT_FOUND)?;
+                if offset > value.len() {
+                    return Err(AttErrorCode::INVALID_OFFSET);
                 }
+                let value = &value[offset..];
+                let len = value.len().min(data.len());
+                data[..len].copy_from_slice(value);
+                return Ok(len);
             }
             Err(AttErrorCode::ATTRIBUTE_NOT_FOUND)
         })
@@ -620,10 +642,8 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
     ) -> Result<(), AttErrorCode> {
         self.state.lock(|n| {
             let mut n = n.borrow_mut();
-            for (client, table) in n.iter_mut() {
-                if client.owns(handle, peer_identity) {
-                    return table.write(att_handle, offset, data);
-                }
+            if let Some(i) = Self::slot_index(&n, handle, peer_identity) {
+                return n[i].1.write(att_handle, offset, data);
             }
             Err(AttErrorCode::ATTRIBUTE_NOT_FOUND)
         })
@@ -642,10 +662,8 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
     ) -> (bool, bool) {
         self.state.lock(|n| {
             let n = n.borrow();
-            for (client, table) in n.iter() {
-                if client.owns(handle, peer_identity) {
-                    return (true, table.get(att_handle).is_some());
-                }
+            if let Some(i) = Self::slot_index(&n, handle, peer_identity) {
+                return (true, n[i].1.get(att_handle).is_some());
             }
             (false, false)
         })
