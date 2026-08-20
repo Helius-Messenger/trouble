@@ -980,7 +980,24 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
     pub(crate) fn handle_security_hci_event(&self, event: bt_hci::event::EventPacket) -> Result<(), Error> {
         #[cfg(feature = "security")]
         {
-            self.security_manager.handle_hci_event(event, self)?;
+            // FW-BLE-SMP-NONFATAL: same discipline as the SMP L2CAP dispatch
+            // above. An encryption-change / key-refresh event landing on an SM
+            // in the "wrong" state (a churned link's leftovers) is a
+            // per-connection outcome — the SM has already evented the failure —
+            // and propagating it here restarted the whole runner (HW-measured:
+            // the guard on the L2CAP path alone still died via THIS path with
+            // "BLE runner err — restarting; err=BleHost(InvalidState)").
+            if let Err(error) = self.security_manager.handle_hci_event(event, self) {
+                match error {
+                    Error::InvalidState | Error::Security(_) => {
+                        warn!(
+                            "security HCI event failed ({:?}) — connection-level failure, host continues",
+                            error
+                        );
+                    }
+                    _ => return Err(error),
+                }
+            }
         }
         Ok(())
     }
@@ -988,7 +1005,19 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
     pub(crate) fn handle_security_hci_le_event(&self, event: bt_hci::event::le::LeEventPacket) -> Result<(), Error> {
         #[cfg(feature = "security")]
         {
-            self.security_manager.handle_hci_le_event(event, self)?;
+            // FW-BLE-SMP-NONFATAL: see handle_security_hci_event — the LTK
+            // request path can error the same way on a churned link.
+            if let Err(error) = self.security_manager.handle_hci_le_event(event, self) {
+                match error {
+                    Error::InvalidState | Error::Security(_) => {
+                        warn!(
+                            "security HCI LE event failed ({:?}) — connection-level failure, host continues",
+                            error
+                        );
+                    }
+                    _ => return Err(error),
+                }
+            }
         }
         Ok(())
     }
