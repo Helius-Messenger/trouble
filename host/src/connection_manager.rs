@@ -961,6 +961,9 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                                         "SMP command failed ({:?}) — pairing-level failure, host continues",
                                         error
                                     );
+                                    // FW-BLE-SMP-NONFATAL (2): don't keep the
+                                    // poisoned SM (see reset_pairing_sm docs).
+                                    self.security_manager.reset_pairing_sm();
                                 }
                                 _ => {
                                     error!("Failed to handle security manager packet, {:?}", error);
@@ -994,6 +997,8 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                             "security HCI event failed ({:?}) — connection-level failure, host continues",
                             error
                         );
+                        // FW-BLE-SMP-NONFATAL (2): don't keep the poisoned SM.
+                        self.security_manager.reset_pairing_sm();
                     }
                     _ => return Err(error),
                 }
@@ -1014,6 +1019,8 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                             "security HCI LE event failed ({:?}) — connection-level failure, host continues",
                             error
                         );
+                        // FW-BLE-SMP-NONFATAL (2): don't keep the poisoned SM.
+                        self.security_manager.reset_pairing_sm();
                     }
                     _ => return Err(error),
                 }

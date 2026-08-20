@@ -634,6 +634,23 @@ pub struct SecurityManager<'d> {
 }
 
 impl<'d> SecurityManager<'d> {
+    /// FW-BLE-SMP-NONFATAL (2): drop any in-flight pairing state machine.
+    ///
+    /// The NONFATAL guards keep the host alive when an SMP/security event
+    /// errors — but before them, the runner restart they replaced ALSO
+    /// (incidentally) rebuilt this state. Swallowing the error while keeping a
+    /// mid-pairing `pairing_sm` poisons every subsequent security exchange on
+    /// the slot: HW-observed as the board answering the central's post-reboot
+    /// Security-Request→encrypt with `SMP Pairing Failed (Unspecified 0x08)`
+    /// in a loop, 4/4 re-pair attempts failing until a full reset (the bench
+    /// R11 "host LTK mismatch" cascade). The guards call this so a swallowed
+    /// failure leaves the SM idle — the next PairingRequest starts clean.
+    pub(crate) fn reset_pairing_sm(&self) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.pairing_sm = None;
+        }
+    }
+
     /// Create a new SecurityManager
     pub(crate) fn new(bonds: &'d RefCell<VecView<BondInformation>>) -> Self {
         let mut rng = ChaCha12Rng::from_seed([0u8; 32]);
