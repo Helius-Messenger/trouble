@@ -1,5 +1,7 @@
 //! BLE connection.
 
+#[cfg(feature = "subrating")]
+use bt_hci::cmd::le::LeSubrateRequest;
 use bt_hci::cmd::le::{
     LeConnUpdate, LeConnectionRateRequest, LeFrameSpaceUpdate, LeReadLocalSupportedFeatures, LeReadPhy,
     LeSetDataLength, LeSetPhy,
@@ -164,6 +166,16 @@ pub struct ConnParams {
     pub supervision_timeout: Duration,
 }
 
+/// Connection subrating parameters
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct SubratingParams {
+    /// Subrate factor: only every `subrate_factor`-th connection event is used.
+    pub subrate_factor: u16,
+    /// Number of connection events to stay awake for after a non-empty packet.
+    pub continuation_number: u16,
+}
+
 /// Connection rate parameters.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -210,6 +222,17 @@ pub enum ConnectionEvent {
         conn_interval: Duration,
         /// Peripheral latency.
         peripheral_latency: u16,
+        /// Supervision timeout.
+        supervision_timeout: Duration,
+    },
+    /// The subrating was updated for this connection.
+    SubratingParamsUpdated {
+        /// Subrate factor: only every `subrate_factor`-th connection event is used.
+        subrate_factor: u16,
+        /// Peripheral latency, in subrated connection events.
+        peripheral_latency: u16,
+        /// Number of connection events to stay awake for after a non-empty packet.
+        continuation_number: u16,
         /// Supervision timeout.
         supervision_timeout: Duration,
     },
@@ -328,6 +351,10 @@ impl ConnectionParamsRequest {
     /// Accept the connection parameters update request.
     ///
     /// If `params` is `None`, use the parameters requested by the peer.
+    ///
+    /// Applying the parameters takes `HCI_LE_Connection_Update`, and only a Central
+    /// ever receives this request, so this needs the `central` feature.
+    #[cfg(feature = "central")]
     pub async fn accept<C, P: PacketPool>(
         mut self,
         params: Option<&RequestedConnParams>,
@@ -643,6 +670,12 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
         self.manager.params(self.index)
     }
 
+    /// The subrating currently in effect, or `None` if the connection is not subrated.
+    #[cfg(feature = "subrating")]
+    pub fn subrating_params(&self) -> Option<SubratingParams> {
+        self.manager.subrating_params(self.index)
+    }
+
     /// Request a certain security level
     ///
     /// For a peripheral this may cause the peripheral to send a security request. For a central
@@ -869,21 +902,24 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
         T: ControllerCmdAsync<LeConnUpdate> + ControllerCmdSync<LeReadLocalSupportedFeatures>,
     {
         let handle = self.handle();
-        // First, check the local supported features to ensure that the connection update is supported.
-        let features = stack.host().command(LeReadLocalSupportedFeatures::new()).await?;
-        if features.supports_conn_parameters_request_procedure() || self.role() == LeConnRole::Central {
-            match stack.host().async_command(into_le_conn_update(handle, params)).await {
-                Ok(_) => return Ok(()),
-                Err(BleHostError::BleHost(crate::Error::Hci(bt_hci::param::Error::UNKNOWN_CONN_IDENTIFIER))) => {
-                    return Err(crate::Error::Disconnected.into());
+        #[cfg(any(feature = "central", feature = "connection-params-update"))]
+        {
+            // First, check the local supported features to ensure that the connection update is supported.
+            let features = stack.host().command(LeReadLocalSupportedFeatures::new()).await?;
+            if features.supports_conn_parameters_request_procedure() || self.role() == LeConnRole::Central {
+                match stack.host().async_command(into_le_conn_update(handle, params)).await {
+                    Ok(_) => return Ok(()),
+                    Err(BleHostError::BleHost(crate::Error::Hci(bt_hci::param::Error::UNKNOWN_CONN_IDENTIFIER))) => {
+                        return Err(crate::Error::Disconnected.into());
+                    }
+                    Err(BleHostError::BleHost(crate::Error::Hci(bt_hci::param::Error::UNSUPPORTED_REMOTE_FEATURE))) => {
+                        // We tried to send the request as a periperhal but the remote central does not support procedure.
+                        // Use the L2CAP signaling method below instead.
+                        // This code path should never be reached when acting as a central. If a bugged controller implementation
+                        // returns this error code we transmit an invalid L2CAP signal which then is rejected by the remote.
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(BleHostError::BleHost(crate::Error::Hci(bt_hci::param::Error::UNSUPPORTED_REMOTE_FEATURE))) => {
-                    // We tried to send the request as a periperhal but the remote central does not support procedure.
-                    // Use the L2CAP signaling method below instead.
-                    // This code path should never be reached when acting as a central. If a bugged controller implementation
-                    // returns this error code we transmit an invalid L2CAP signal which then is rejected by the remote.
-                }
-                Err(e) => return Err(e),
             }
         }
 
@@ -930,6 +966,47 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
                 frame_space_max_dur,
                 phys,
                 spacing_types,
+            ))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(BleHostError::BleHost(crate::Error::Hci(bt_hci::param::Error::UNKNOWN_CONN_IDENTIFIER))) => {
+                Err(crate::Error::Disconnected.into())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Request a change in connection subrate for this connection.
+    ///
+    /// Uses the LE Subrate Request HCI command (0x007e), which may be issued by both the
+    /// central and the peripheral, unlike [`request_connection_rate`][Self::request_connection_rate]
+    /// which is central-only. The subrate change takes effect within a few base connection
+    /// intervals, much faster than a full connection parameter update.
+    ///
+    /// Requires the `subrating` feature.
+    #[cfg(feature = "subrating")]
+    pub async fn request_conn_subrate<T>(
+        &self,
+        stack: &Stack<'_, T, P>,
+        subrate_min: u16,
+        subrate_max: u16,
+        max_latency: u16,
+        continuation_number: u16,
+        supervision_timeout: Duration,
+    ) -> Result<(), BleHostError<T::Error>>
+    where
+        T: ControllerCmdAsync<LeSubrateRequest>,
+    {
+        match stack
+            .host()
+            .async_command(LeSubrateRequest::new(
+                self.handle(),
+                subrate_min,
+                subrate_max,
+                max_latency,
+                continuation_number,
+                bt_hci_duration(supervision_timeout),
             ))
             .await
         {
@@ -990,6 +1067,7 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
     }
 }
 
+#[cfg(any(feature = "central", feature = "connection-params-update"))]
 fn into_le_conn_update(handle: ConnHandle, params: &RequestedConnParams) -> LeConnUpdate {
     LeConnUpdate::new(
         handle,

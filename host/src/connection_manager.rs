@@ -12,6 +12,8 @@ use embassy_sync::waitqueue::WakerRegistration;
 #[cfg(feature = "security")]
 use embassy_time::TimeoutError;
 
+#[cfg(feature = "subrating")]
+use crate::connection::SubratingParams;
 use crate::connection::{ConnParams, Connection, ConnectionEvent, SecurityLevel};
 use crate::host::EventHandler;
 use crate::pdu::Pdu;
@@ -198,20 +200,48 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
         self.connection(index).events.try_send(event).unwrap();
     }
 
+    /// A subrate factor of 1 means every connection event is used, the connection is not subrated.
+    #[cfg(feature = "subrating")]
+    fn subrating(subrate_factor: u16, continuation_number: u16) -> Option<SubratingParams> {
+        (subrate_factor > 1).then_some(SubratingParams {
+            subrate_factor,
+            continuation_number,
+        })
+    }
+
     pub(crate) fn post_handle_event(&self, handle: ConnHandle, event: ConnectionEvent) -> Result<(), Error> {
         for entry in self.connections.borrow_mut().iter_mut() {
             if entry.state == ConnectionState::Connected && handle == entry.handle {
-                if let ConnectionEvent::ConnectionParamsUpdated {
-                    conn_interval,
-                    peripheral_latency,
-                    supervision_timeout,
-                } = event
-                {
-                    entry.params = ConnParams {
+                match event {
+                    ConnectionEvent::ConnectionParamsUpdated {
                         conn_interval,
                         peripheral_latency,
                         supervision_timeout,
+                    } => {
+                        // Changing the connection interval resets subrating.
+                        #[cfg(feature = "subrating")]
+                        if conn_interval != entry.params.conn_interval {
+                            entry.subrating_params = None;
+                        }
+                        entry.params = ConnParams {
+                            conn_interval,
+                            peripheral_latency,
+                            supervision_timeout,
+                        }
                     }
+                    // The subrate procedure leaves the connection interval alone.
+                    #[cfg(feature = "subrating")]
+                    ConnectionEvent::SubratingParamsUpdated {
+                        subrate_factor,
+                        peripheral_latency,
+                        continuation_number,
+                        supervision_timeout,
+                    } => {
+                        entry.params.peripheral_latency = peripheral_latency;
+                        entry.params.supervision_timeout = supervision_timeout;
+                        entry.subrating_params = Self::subrating(subrate_factor, continuation_number);
+                    }
+                    _ => {}
                 }
 
                 entry.events.try_send(event).map_err(|_| Error::OutOfMemory)?;
@@ -326,6 +356,11 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
 
     pub(crate) fn params(&self, index: u8) -> ConnParams {
         self.connection(index).params
+    }
+
+    #[cfg(feature = "subrating")]
+    pub(crate) fn subrating_params(&self, index: u8) -> Option<SubratingParams> {
+        self.connection(index).subrating_params
     }
 
     pub(crate) fn set_att_mtu(&self, index: u8, mtu: u16) {
@@ -450,6 +485,7 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                 #[cfg(feature = "gatt")]
                 {
                     storage.gatt.clear();
+                    storage.gatt_client.clear();
                     storage.gatt_client_waker.wake();
                     storage.indication_in_flight = false;
                     storage.indication_cfm_received = false;
@@ -522,6 +558,10 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                 storage.peer_identity = identity;
                 storage.role = role;
                 storage.params = params;
+                #[cfg(feature = "subrating")]
+                {
+                    storage.subrating_params = None;
+                }
                 #[cfg(feature = "security")]
                 {
                     storage.bond_rejected = false;
@@ -660,18 +700,10 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
         handle: ConnHandle,
         cx: Option<&mut Context<'_>>,
     ) -> Poll<Result<AclSendLock<'_, P>, Error>> {
-        for (index, storage) in self.connections.borrow_mut().iter_mut().enumerate() {
-            if storage.handle != handle {
-                continue;
-            }
-
-            if !matches!(storage.state, ConnectionState::Connecting | ConnectionState::Connected) {
-                return Poll::Ready(Err(Error::Disconnected));
-            }
-
+        if let Some(mut storage) = self.connection_by_handle_mut(handle) {
             if !storage.acl_send_locked {
                 storage.acl_send_locked = true;
-                return Poll::Ready(Ok(AclSendLock::new(handle, self)));
+                Poll::Ready(Ok(AclSendLock::new(handle, self)))
             } else {
                 if let Some(cx) = cx {
                     storage.acl_send_lock_waker.register(cx.waker());
@@ -679,11 +711,12 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                 #[cfg(feature = "connection-metrics")]
                 storage.metrics.blocked_send();
 
-                return Poll::Pending;
+                Poll::Pending
             }
+        } else {
+            warn!("[link][poll_acquire_acl_send_lock] connection {:?} not found", handle);
+            Poll::Ready(Err(Error::NotFound))
         }
-        warn!("[link][poll_acquire_acl_send_lock] connection {:?} not found", handle);
-        Poll::Ready(Err(Error::NotFound))
     }
 
     pub(crate) fn get_att_mtu(&self, index: u8) -> u16 {
@@ -920,20 +953,12 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
         {
             for storage in self.connections.borrow().iter() {
                 match storage.state {
-                    // FW-BLE-PAIRDISPATCH fix: also process SMP while
-                    // the link is still `Connecting` (LL connection is up — handle
-                    // is set — but the app hasn't `accept()`ed it to `Connected`
-                    // yet). A central can send its PairingRequest immediately after
-                    // the connection completes, BEFORE the peripheral app accepts;
-                    // dropping it here (Connected-only gate) was why the nRF techo
-                    // never responded → Authentication Failure (HW-root-caused +
-                    // validated 2026-07-23: with this relax the first SMP PDU is
-                    // dispatched while `connected=false` and the pairing completes
-                    // to security_level=Encrypted). SMP doesn't need the app-level
-                    // accept, only the live LL link.
-                    ConnectionState::Connected | ConnectionState::Connecting
-                        if storage.handle == handle =>
-                    {
+                    // Also handle SMP while the connection is still `Connecting`.
+                    // A central can send its Pairing Request as soon as the link is
+                    // up, before the peripheral has `accept()`ed the connection; if
+                    // we only match `Connected` here that packet is silently dropped
+                    // and pairing never starts.
+                    ConnectionState::Connected | ConnectionState::Connecting if storage.handle == handle => {
                         if storage.smp_timeout {
                             warn!("Ignoring security channel packet after SMP timeout");
                             return Ok(());
@@ -1040,7 +1065,11 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
             + crate::ControllerCmdSync<bt_hci::cmd::le::LeLongTermKeyRequestNegativeReply>
             + crate::ControllerCmdAsync<bt_hci::cmd::le::LeEnableEncryption>,
     {
-        use bt_hci::cmd::le::{LeEnableEncryption, LeLongTermKeyRequestNegativeReply, LeLongTermKeyRequestReply};
+        #[cfg(feature = "central")]
+        use bt_hci::cmd::le::LeEnableEncryption;
+        // FW-BLE stale-bond fix: NegativeReply stays — the peripheral answers an
+        // LE LTK Request with a negative reply when it holds no key (see below).
+        use bt_hci::cmd::le::{LeLongTermKeyRequestNegativeReply, LeLongTermKeyRequestReply};
 
         match _event {
             crate::security_manager::SecurityEventData::SendLongTermKey(handle, ediv, rand) => {
@@ -1087,6 +1116,7 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
             crate::security_manager::SecurityEventData::EnableEncryption(handle, bond_info) => {
                 let role = self.connection_by_handle(handle).map(|x| x.role);
                 if let Some(role) = role {
+                    #[cfg(feature = "central")]
                     if LeConnRole::Central == role {
                         #[cfg(feature = "legacy-pairing")]
                         let (ediv, rand) = (bond_info.ediv, bond_info.rand);
@@ -1247,6 +1277,8 @@ pub struct ConnectionStorage<P> {
     pub role: LeConnRole,
     pub peer_identity: Identity,
     pub params: ConnParams,
+    #[cfg(feature = "subrating")]
+    pub subrating_params: Option<SubratingParams>,
     pub att_mtu: Option<NonZeroU16>,
     pub link_credits: usize,
     pub link_credit_waker: WakerRegistration,
@@ -1367,6 +1399,8 @@ impl<P> ConnectionStorage<P> {
                 irk: None,
             },
             params: ConnParams::new(),
+            #[cfg(feature = "subrating")]
+            subrating_params: None,
             att_mtu: None,
             link_credits: 0,
             link_credit_waker: WakerRegistration::new(),

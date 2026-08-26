@@ -13,6 +13,10 @@ use bt_hci::cmd::controller_baseband::{
     SetEventMaskPage2,
 };
 use bt_hci::cmd::info::ReadBdAddr;
+#[cfg(feature = "subrating")]
+use bt_hci::cmd::le::LeSetHostFeature;
+#[cfg(feature = "shorter-connection-intervals")]
+use bt_hci::cmd::le::LeSetHostFeatureV2;
 #[cfg(feature = "security")]
 use bt_hci::cmd::le::{
     LeAddDeviceToResolvingList, LeClearResolvingList, LeRand, LeRemoveDeviceFromResolvingList,
@@ -32,6 +36,8 @@ use bt_hci::data::{AclBroadcastFlag, AclPacket, AclPacketBoundary};
 use bt_hci::event::le::LeAdvertisingReport;
 #[cfg(feature = "scan")]
 use bt_hci::event::le::LeExtendedAdvertisingReport;
+#[cfg(feature = "subrating")]
+use bt_hci::event::le::LeSubrateChange;
 use bt_hci::event::le::{
     LeAdvertisingSetTerminated, LeConnectionComplete, LeConnectionRateChange, LeConnectionUpdateComplete,
     LeDataLengthChange, LeEnhancedConnectionComplete, LeEventKind, LeEventPacket, LeFrameSpaceUpdateComplete,
@@ -42,16 +48,14 @@ use bt_hci::event::le::{LeCisEstablished, LeCisRequest};
 use bt_hci::event::{DisconnectionComplete, EventKind, NumberOfCompletedPackets, Vendor};
 #[cfg(feature = "security")]
 use bt_hci::param::BdAddr;
+#[cfg(feature = "scan")]
+use bt_hci::param::FilterDuplicates;
 use bt_hci::param::{
-    AddrKind, AdvHandle, AdvSet, ConnHandle, DisconnectReason, EventMask, EventMaskPage2, FilterDuplicates, LeConnRole,
-    LeEventMask, Status,
+    AddrKind, AdvHandle, AdvSet, ConnHandle, DisconnectReason, EventMask, EventMaskPage2, LeConnRole, LeEventMask,
+    Status,
 };
 use bt_hci::{ControllerToHostPacket, FromHciBytes, WriteHci};
 use embassy_futures::select::{select3, select5, Either3, Either5};
-// `command_request_gate: Mutex<NoopRawMutex, ()>` is `#[cfg(feature = "security")]`
-// (see HostState), so a security-enabled *peripheral-only* build (no `central`/
-// `scan`) also needs these imports — the upstream gates were narrower than the
-// field and E0425'd this feature combo. Widened to match the field's cfg.
 #[cfg(any(feature = "scan", feature = "security"))]
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 #[cfg(feature = "security")]
@@ -370,12 +374,18 @@ where
 {
     /// Poll whether any command should be cancelled or the resolving list should be synced.
     fn poll_cancelled(&self, cx: &mut Context<'_>) -> Poll<CancelledCommandState> {
+        // Not every branch below survives every feature combination.
+        let _ = cx;
+
+        #[cfg(feature = "central")]
         if let Poll::Ready(ctx) = self.state.connect_command_state.poll_cancelled(cx) {
             return Poll::Ready(CancelledCommandState::Connect(ctx));
         }
+        #[cfg(feature = "peripheral")]
         if let Poll::Ready(ctx) = self.state.advertise_command_state.poll_cancelled(cx) {
             return Poll::Ready(CancelledCommandState::Advertise(ctx));
         }
+        #[cfg(feature = "scan")]
         if let Poll::Ready(ctx) = self.state.scan_command_state.poll_cancelled(cx) {
             return Poll::Ready(CancelledCommandState::Scan(ctx));
         }
@@ -1268,7 +1278,10 @@ impl<'d, C: Controller, P: PacketPool> Runner<'d, C, P> {
             + for<'t> ControllerCmdSync<HostNumberOfCompletedPackets<'t>>
             + ControllerCmdSync<LeReadBufferSize>
             + ControllerCmdSync<ReadBdAddr>
-            + crate::SecurityCmds,
+            + crate::SecurityCmds
+            + crate::IsoStreamCmds
+            + crate::SubratingCmds
+            + crate::ShortConnIntervalCmds,
         C::Error: crate::fmt::Format,
     {
         let dummy = DummyHandler;
@@ -1296,7 +1309,10 @@ impl<'d, C: Controller, P: PacketPool> Runner<'d, C, P> {
             + ControllerCmdSync<LeCreateConnCancel>
             + ControllerCmdSync<LeReadBufferSize>
             + ControllerCmdSync<ReadBdAddr>
-            + crate::SecurityCmds,
+            + crate::SecurityCmds
+            + crate::IsoStreamCmds
+            + crate::SubratingCmds
+            + crate::ShortConnIntervalCmds,
         C::Error: crate::fmt::Format,
     {
         let control_fut = self.control.run();
@@ -1336,13 +1352,12 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
     where
         C: ControllerCmdSync<Disconnect>,
     {
-        const MAX_HCI_PACKET_LEN: usize = 259;
         let host = &self.host;
         // use embassy_time::Instant;
         // let mut last = Instant::now();
         loop {
             // Task handling receiving data from the controller.
-            let mut rx = [0u8; MAX_HCI_PACKET_LEN];
+            let mut rx = host.controller.alloc_buf().map_err(BleHostError::Controller)?;
             // let now = Instant::now();
             // let elapsed = (now - last).as_millis();
             // if elapsed >= 1 {
@@ -1527,6 +1542,25 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
                                         );
                                     }
                                 }
+                                #[cfg(feature = "subrating")]
+                                LeEventKind::LeSubrateChange => {
+                                    let event = unwrap!(LeSubrateChange::from_hci_bytes_complete(event.data));
+                                    if let Err(e) = event.status.to_result() {
+                                        warn!("[host] error in subrate change for {:?}: {:?}", event.handle, e);
+                                    } else {
+                                        let _ = host.state.connections.post_handle_event(
+                                            event.handle,
+                                            ConnectionEvent::SubratingParamsUpdated {
+                                                subrate_factor: event.subrate_factor,
+                                                peripheral_latency: event.peripheral_latency,
+                                                continuation_number: event.continuation_number,
+                                                supervision_timeout: Duration::from_micros(
+                                                    event.supervision_timeout.as_micros(),
+                                                ),
+                                            },
+                                        );
+                                    }
+                                }
                                 LeEventKind::LeConnectionRateChange => {
                                     let event = unwrap!(LeConnectionRateChange::from_hci_bytes_complete(event.data));
                                     if let Err(e) = event.status.to_result() {
@@ -1651,8 +1685,11 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
 }
 
 enum CancelledCommandState {
+    #[cfg(feature = "central")]
     Connect(bool),
+    #[cfg(feature = "peripheral")]
     Advertise(bool),
+    #[cfg(feature = "scan")]
     Scan(bool),
     #[cfg(feature = "security")]
     SyncResolvingList(ResolvingListUpdate),
@@ -1682,7 +1719,10 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
             + for<'t> ControllerCmdSync<HostNumberOfCompletedPackets<'t>>
             + ControllerCmdSync<LeReadBufferSize>
             + ControllerCmdSync<ReadBdAddr>
-            + crate::SecurityCmds,
+            + crate::SecurityCmds
+            + crate::IsoStreamCmds
+            + crate::SubratingCmds
+            + crate::ShortConnIntervalCmds,
         C::Error: crate::fmt::Format,
     {
         let host = &self.host;
@@ -1751,13 +1791,73 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
             .enable_le_phy_update_complete(true)
             .enable_le_data_length_change(true);
 
+        #[cfg(feature = "subrating")]
+        let mask = mask.enable_le_subrate_change(true);
+
         #[cfg(feature = "iso")]
         let mask = mask.enable_le_cis_established_v1(true).enable_le_cis_request(true);
 
         #[cfg(feature = "connection-params-update")]
         let mask = mask.enable_le_remote_conn_parameter_request(true);
 
+        #[cfg(feature = "shorter-connection-intervals")]
+        let mask = mask.enable_le_connection_rate_change(true);
+
         LeSetEventMask::new(mask).exec(host.controller).await?;
+
+        // Without the Connection Isochronous Stream (Host Support) bit set, a peer central is not allowed to
+        // create or accept a CIS.
+        #[cfg(feature = "iso")]
+        {
+            const LE_FEATURE_CIS_HOST: u8 = 32;
+            if let Err(e) = LeSetHostFeature::new(LE_FEATURE_CIS_HOST, 1)
+                .exec(host.controller)
+                .await
+            {
+                match e {
+                    cmd::Error::Hci(bt_hci::param::Error::UNSUPPORTED | bt_hci::param::Error::UNKNOWN_CMD) => {
+                        warn!("[host] connection isochronous streams are not supported")
+                    }
+                    e => Err(e)?,
+                }
+            }
+        }
+
+        // Without the Connection Subrating (Host Support) bit set, a peer central is not allowed to
+        // start the Connection Subrate Update procedure on us.
+        #[cfg(feature = "subrating")]
+        {
+            const LE_FEATURE_CONN_SUBRATING_HOST: u8 = 38;
+            if let Err(e) = LeSetHostFeature::new(LE_FEATURE_CONN_SUBRATING_HOST, 1)
+                .exec(host.controller)
+                .await
+            {
+                match e {
+                    cmd::Error::Hci(bt_hci::param::Error::UNSUPPORTED | bt_hci::param::Error::UNKNOWN_CMD) => {
+                        warn!("[host] connection subrating is not supported")
+                    }
+                    e => Err(e)?,
+                }
+            }
+        }
+
+        // Without the Shorter Connection Intervals (Host Support) bit set, a peer central is not allowed to
+        // start the Connection Rate Change procedure on us.
+        #[cfg(feature = "shorter-connection-intervals")]
+        {
+            const LE_FEATURE_SHORTER_CONNECTION_INTERVALS_HOST: u16 = 73;
+            if let Err(e) = LeSetHostFeatureV2::new(LE_FEATURE_SHORTER_CONNECTION_INTERVALS_HOST, 1)
+                .exec(host.controller)
+                .await
+            {
+                match e {
+                    cmd::Error::Hci(bt_hci::param::Error::UNSUPPORTED | bt_hci::param::Error::UNKNOWN_CMD) => {
+                        warn!("[host] shorter connection intervals are not supported")
+                    }
+                    e => Err(e)?,
+                }
+            }
+        }
 
         info!(
             "[host] using packet pool with MTU {} capacity {}",
@@ -1887,6 +1987,7 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                     request.confirm();
                 }
                 Either5::Third(action) => match action {
+                    #[cfg(feature = "central")]
                     CancelledCommandState::Connect(_) => {
                         trace!("[host] cancel connection create");
                         if let Err(err) = host.command(LeCreateConnCancel::new()).await {
@@ -1895,9 +1996,10 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                         // Signal to ensure no one is stuck
                         host.state.connect_command_state.canceled();
                     }
+                    #[cfg(feature = "peripheral")]
                     CancelledCommandState::Advertise(ext) => {
                         trace!("[host] disabling advertising");
-                        // Cancelling advertising that is ALREADY stopped is success,
+// Cancelling advertising that is ALREADY stopped is success,
                         // not failure — the desired end state (not advertising)
                         // already holds. The controller auto-stops advertising when a
                         // connection is established, so under connect/disconnect churn
@@ -1914,9 +2016,18 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                         //
                         // Mirror the `Connect` arm above: log, do NOT propagate, and
                         // ALWAYS clear the state so nobody is left stuck.
+                        #[cfg(feature = "extended-advertising")]
                         let res = if ext {
                             host.command(LeSetExtAdvEnable::new(false, &[])).await
                         } else {
+                            host.command(LeSetAdvEnable::new(false)).await
+                        };
+                        #[cfg(not(feature = "extended-advertising"))]
+                        let res = {
+                            // Extended advertising cannot have been started
+                            // (`advertise_ext` is compiled out), so `ext` is
+                            // always false here.
+                            let _ = ext;
                             host.command(LeSetAdvEnable::new(false)).await
                         };
                         if let Err(err) = res {
@@ -1925,6 +2036,7 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                         // Signal to ensure no one is stuck
                         host.state.advertise_command_state.canceled();
                     }
+                    #[cfg(feature = "scan")]
                     CancelledCommandState::Scan(ext) => {
                         trace!("[host] disabling scanning");
                         // Same reasoning as the Advertise arm above: cancelling a scan
