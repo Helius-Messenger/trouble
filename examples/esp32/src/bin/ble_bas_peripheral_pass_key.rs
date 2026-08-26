@@ -5,7 +5,7 @@ use embassy_executor::Spawner;
 use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
 use esp_radio::ble::controller::BleConnector;
-use trouble_example_apps::ble_bas_central_sec;
+use trouble_example_apps::ble_bas_peripheral_pass_key;
 use trouble_host::prelude::ExternalController;
 use {esp_alloc as _, esp_backtrace as _};
 
@@ -24,5 +24,5 @@ async fn main(_s: Spawner) {
     let connector = BleConnector::new(bluetooth, Default::default()).unwrap();
     let controller: ExternalController<_, 20> = ExternalController::new(connector);
 
-    ble_bas_central_sec::run(controller).await;
+    ble_bas_peripheral_pass_key::run(controller).await;
 }

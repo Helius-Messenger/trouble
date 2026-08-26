@@ -10,6 +10,8 @@ use core::mem::{ManuallyDrop, MaybeUninit};
 
 use advertise::AdvertisementDataError;
 use bt_hci::cmd::le::LeReadMinimumSupportedConnectionInterval;
+#[cfg(feature = "shorter-connection-intervals")]
+use bt_hci::cmd::le::LeSetHostFeatureV2;
 use bt_hci::cmd::status::ReadRssi;
 use bt_hci::cmd::{AsyncCmd, SyncCmd};
 use bt_hci::param::{AddrKind, BdAddr, ConnHandle};
@@ -76,7 +78,6 @@ pub mod prelude {
     //! Convenience include of most commonly used types.
     pub use bt_hci::controller::ExternalController;
     pub use bt_hci::param::{AddrKind, BdAddr, LeConnRole as Role, PhyKind, PhyMask};
-    pub use bt_hci::transport::SerialTransport;
     pub use bt_hci::uuid::*;
     #[cfg(feature = "derive")]
     pub use heapless::String as HeaplessString;
@@ -519,6 +520,48 @@ pub trait SecurityCmds: bt_hci::controller::Controller {}
 #[cfg(not(feature = "security"))]
 impl<C: bt_hci::controller::Controller> SecurityCmds for C {}
 
+/// Auto-implemented when the `iso` feature is enabled.
+#[cfg(feature = "iso")]
+pub trait IsoStreamCmds: bt_hci::controller::Controller + ControllerCmdSync<LeSetHostFeature> {}
+
+#[cfg(feature = "iso")]
+impl<C: bt_hci::controller::Controller + ControllerCmdSync<LeSetHostFeature>> IsoStreamCmds for C {}
+
+/// Auto-implemented when `iso` is not enabled.
+#[cfg(not(feature = "iso"))]
+pub trait IsoStreamCmds: bt_hci::controller::Controller {}
+
+#[cfg(not(feature = "iso"))]
+impl<C: bt_hci::controller::Controller> IsoStreamCmds for C {}
+
+/// Auto-implemented when the `subrating` feature is enabled.
+#[cfg(feature = "subrating")]
+pub trait SubratingCmds: bt_hci::controller::Controller + ControllerCmdSync<LeSetHostFeature> {}
+
+#[cfg(feature = "subrating")]
+impl<C: bt_hci::controller::Controller + ControllerCmdSync<LeSetHostFeature>> SubratingCmds for C {}
+
+/// Auto-implemented when subrating is not enabled.
+#[cfg(not(feature = "subrating"))]
+pub trait SubratingCmds: bt_hci::controller::Controller {}
+
+#[cfg(not(feature = "subrating"))]
+impl<C: bt_hci::controller::Controller> SubratingCmds for C {}
+
+/// Auto-implemented when `shorter-connection-intervals` isenabled.
+#[cfg(feature = "shorter-connection-intervals")]
+pub trait ShortConnIntervalCmds: bt_hci::controller::Controller + ControllerCmdSync<LeSetHostFeatureV2> {}
+
+#[cfg(feature = "shorter-connection-intervals")]
+impl<C: bt_hci::controller::Controller + ControllerCmdSync<LeSetHostFeatureV2>> ShortConnIntervalCmds for C {}
+
+/// Auto-implemented when `shorter-connection-intervals` is not enabled.
+#[cfg(not(feature = "shorter-connection-intervals"))]
+pub trait ShortConnIntervalCmds: bt_hci::controller::Controller {}
+
+#[cfg(not(feature = "shorter-connection-intervals"))]
+impl<C: bt_hci::controller::Controller> ShortConnIntervalCmds for C {}
+
 /// Trait that defines the controller implementation required by the host.
 ///
 /// The controller must implement the required commands and events to be able to be used with Trouble.
@@ -553,6 +596,9 @@ pub trait Controller:
     + for<'t> ControllerCmdSync<LeSetScanResponseData>
     + ControllerCmdSync<ReadBdAddr>
     + SecurityCmds
+    + SubratingCmds
+    + IsoStreamCmds
+    + ShortConnIntervalCmds
 {
 }
 
@@ -586,7 +632,10 @@ impl<
             + for<'t> ControllerCmdSync<LeSetAdvEnable>
             + for<'t> ControllerCmdSync<LeSetScanResponseData>
             + ControllerCmdSync<ReadBdAddr>
-            + SecurityCmds,
+            + SecurityCmds
+            + SubratingCmds
+            + IsoStreamCmds
+            + ShortConnIntervalCmds,
     > Controller for C
 {
 }
@@ -818,6 +867,17 @@ impl<'stack, C: Controller, P: PacketPool> StackBuilder<'stack, C, P> {
         self
     }
 
+    /// Set a fixed passkey to use for PassKey Entry pairing (DisplayOnly).
+    ///
+    /// When set, this passkey will be displayed to the user instead of a randomly generated one.
+    ///
+    /// Set to `None` to return to random passkey generation (the default).
+    #[cfg(feature = "security")]
+    pub fn set_passkey(mut self, passkey: Option<u32>) -> Self {
+        self.host_state().connections.security_manager.set_passkey(passkey);
+        self
+    }
+
     /// Enable or disable secure connections only mode.
     ///
     /// When enabled, legacy pairing is rejected even if the `legacy-pairing` feature is compiled in.
@@ -901,6 +961,16 @@ impl<'stack, C: Controller, P: PacketPool> Stack<'stack, C, P> {
             .connections
             .security_manager
             .set_io_capabilities(io_capabilities);
+    }
+
+    /// Set a fixed passkey to use for PassKey Entry pairing (DisplayOnly).
+    ///
+    /// When set, this passkey will be displayed to the user instead of a randomly generated one.
+    ///
+    /// Set to `None` to return to random passkey generation (the default).
+    #[cfg(feature = "security")]
+    pub fn set_passkey(&self, passkey: Option<u32>) {
+        self.host_state.connections.security_manager.set_passkey(passkey);
     }
 
     /// Enable or disable secure connections only mode.
