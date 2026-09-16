@@ -871,12 +871,11 @@ where
                 if let Some((header, p)) = self.state.connections.reassembly(acl.handle(), |p| {
                     if !p.in_progress() {
                         warn!(
-                            "[host] unexpected continuation fragment of length {} for handle {}: {:?}",
+                            "[host] unexpected continuation fragment of length {} for handle {}: discarding orphan",
                             acl.data().len(),
                             acl.handle().raw(),
-                            p
                         );
-                        return Err(Error::InvalidState);
+                        return Ok(None);
                     }
                     p.update(acl.data())
                 })? {
