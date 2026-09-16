@@ -542,6 +542,11 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
             if ConnectionState::Disconnected == storage.state && storage.refcount == 0 {
                 storage.events.clear();
                 storage.reassembly.clear();
+                #[cfg(feature = "gatt")]
+                {
+                    storage.gatt.clear();
+                    storage.gatt_client.clear();
+                }
                 storage.state = ConnectionState::Connecting;
                 storage.link_credits = default_credits;
                 storage.acl_send_locked = false;
