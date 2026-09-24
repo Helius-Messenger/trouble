@@ -2001,7 +2001,7 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                     #[cfg(feature = "peripheral")]
                     CancelledCommandState::Advertise(ext) => {
                         trace!("[host] disabling advertising");
-// Cancelling advertising that is ALREADY stopped is success,
+                        // Cancelling advertising that is ALREADY stopped is success,
                         // not failure — the desired end state (not advertising)
                         // already holds. The controller auto-stops advertising when a
                         // connection is established, so under connect/disconnect churn

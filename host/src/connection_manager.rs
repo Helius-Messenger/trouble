@@ -1128,9 +1128,7 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                         // bond). Negative-reply so the controller fails LL encryption
                         // immediately and the central re-pairs, instead of stalling to the
                         // ~38 s LMP Response Timeout (HCI 0x22).
-                        let _ = host
-                            .command(LeLongTermKeyRequestNegativeReply::new(handle))
-                            .await?;
+                        let _ = host.command(LeLongTermKeyRequestNegativeReply::new(handle)).await?;
                     }
                 } else {
                     warn!("[host] Long term key request reply failed, unknown peer");
@@ -1138,9 +1136,7 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                     // it is bonded, but we have no key. Negative-reply so the controller
                     // does not silently wait for a reply that never comes (~38 s LMP
                     // Response Timeout → HCI 0x22); the central then re-pairs.
-                    let _ = host
-                        .command(LeLongTermKeyRequestNegativeReply::new(handle))
-                        .await?;
+                    let _ = host.command(LeLongTermKeyRequestNegativeReply::new(handle)).await?;
                 }
             }
             crate::security_manager::SecurityEventData::EnableEncryption(handle, bond_info) => {
