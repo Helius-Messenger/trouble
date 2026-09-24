@@ -309,9 +309,13 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
     ) -> Result<(), AttErrorCode> {
         self.can_write(connection, att)?;
         if matches!(att.data, AttributeData::ClientSpecific { .. }) {
-            return self
-                .client_att_tables
-                .write(connection.handle(), &connection.peer_identity(), handle, offset, data);
+            return self.client_att_tables.write(
+                connection.handle(),
+                &connection.peer_identity(),
+                handle,
+                offset,
+                data,
+            );
         }
         att.write(offset, data)
     }

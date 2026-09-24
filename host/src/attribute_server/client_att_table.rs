@@ -584,10 +584,7 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
         handle: ConnHandle,
         peer_identity: &Identity,
     ) -> Option<usize> {
-        if let Some(i) = n
-            .iter()
-            .position(|(client, _)| client.handle == Some(handle))
-        {
+        if let Some(i) = n.iter().position(|(client, _)| client.handle == Some(handle)) {
             return Some(i);
         }
         n.iter().position(|(client, _)| client.owns(handle, peer_identity))
@@ -602,8 +599,7 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
     ) -> Option<R> {
         self.state.lock(|n| {
             let n = n.borrow();
-            Self::slot_index(&n, handle, peer_identity)
-                .and_then(|i| n[i].1.get(att_handle).map(f))
+            Self::slot_index(&n, handle, peer_identity).and_then(|i| n[i].1.get(att_handle).map(f))
         })
     }
 
@@ -654,12 +650,7 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
     /// which makes "nobody is subscribed" indistinguishable from "the slot that
     /// held the subscription is gone" — the exact ambiguity behind a peripheral
     /// that ACKs a CCCD enable and then never notifies.
-    pub(crate) fn diag_lookup(
-        &self,
-        handle: ConnHandle,
-        peer_identity: &Identity,
-        att_handle: u16,
-    ) -> (bool, bool) {
+    pub(crate) fn diag_lookup(&self, handle: ConnHandle, peer_identity: &Identity, att_handle: u16) -> (bool, bool) {
         self.state.lock(|n| {
             let n = n.borrow();
             if let Some(i) = Self::slot_index(&n, handle, peer_identity) {
@@ -735,10 +726,7 @@ mod tests {
         const CCCD: u16 = 53;
 
         fn ident(last: u8) -> Identity {
-            Identity {
-                addr: Address::new(AddrKind::PUBLIC, BdAddr::new([1, 2, 3, 4, 5, last])),
-                irk: None,
-            }
+            Address::new(AddrKind::PUBLIC, BdAddr::new([1, 2, 3, 4, 5, last])).into()
         }
 
         let mut builder = ClientAttTable::builder();
@@ -850,10 +838,7 @@ mod tests {
 
         const CCCD: u16 = 53;
         fn ident(last: u8) -> Identity {
-            Identity {
-                addr: Address::new(AddrKind::PUBLIC, BdAddr::new([1, 2, 3, 4, 5, last])),
-                irk: None,
-            }
+            Address::new(AddrKind::PUBLIC, BdAddr::new([1, 2, 3, 4, 5, last])).into()
         }
 
         let mut builder = ClientAttTable::builder();
