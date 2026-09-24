@@ -26,7 +26,7 @@ use crate::connection::Connection;
 use crate::connection::SecurityLevel;
 use crate::cursor::{ReadCursor, WriteCursor};
 use crate::pdu::Pdu;
-use crate::prelude::{CharacteristicDeclaration, ConnectionEvent, ConnectionParamsRequest};
+use crate::prelude::{AttMtuRequest, CharacteristicDeclaration, ConnectionEvent, ConnectionParamsRequest};
 #[cfg(feature = "security")]
 use crate::security_manager::PassKey;
 use crate::types::gatt_traits::{AsGatt, FromGatt, FromGattError};
@@ -76,6 +76,11 @@ pub enum GattConnectionEvent<'stack, 'server, P: PacketPool> {
     /// [`ConnectionParamsRequest::accept()`] or [`ConnectionParamsRequest::reject()`]
     /// must be called to respond to the request.
     RequestConnectionParams(ConnectionParamsRequest),
+    /// A request to exchange the ATT MTU.
+    ///
+    /// [`GattConnection::accept_att_mtu()`] or [`AttMtuRequest::accept()`]
+    /// must be called to respond to the request.
+    RequestAttMtu(AttMtuRequest),
     /// The data length was changed for this connection.
     DataLengthUpdated {
         /// Max TX octets.
@@ -205,6 +210,11 @@ impl<'stack, 'server, P: PacketPool> GattConnection<'stack, 'server, P> {
         self.connection.provide_oob_data(local_oob, peer_oob)
     }
 
+    /// Accept an ATT MTU exchange request.
+    pub async fn accept_att_mtu(&self, req: AttMtuRequest) -> Result<(), Error> {
+        req.accept(&self.connection).await
+    }
+
     /// Wait for the next GATT connection event.
     ///
     /// Uses the attribute server to handle the protocol.
@@ -233,6 +243,7 @@ impl<'stack, 'server, P: PacketPool> GattConnection<'stack, 'server, P> {
                     supervision_timeout,
                 },
                 ConnectionEvent::RequestConnectionParams(req) => GattConnectionEvent::RequestConnectionParams(req),
+                ConnectionEvent::RequestAttMtu(req) => GattConnectionEvent::RequestAttMtu(req),
                 ConnectionEvent::PhyUpdated { tx_phy, rx_phy } => GattConnectionEvent::PhyUpdated { tx_phy, rx_phy },
                 ConnectionEvent::DataLengthUpdated {
                     max_tx_octets,
