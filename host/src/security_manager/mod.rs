@@ -1181,7 +1181,7 @@ impl<'d> SecurityManager<'d> {
     ) -> Result<(), Error> {
         let len = packet.total_size();
         trace!("[security manager] Send {} {}", packet.command, len);
-        connections.try_outbound(handle, packet.into_pdu())
+        connections.try_outbound_smp(handle, packet.into_pdu())
     }
 
     /// Send a packet
@@ -1220,7 +1220,7 @@ impl<'sm, 'cm, 'cm2, 'cs, P: PacketPool> PairingOps<P> for PairingOpsImpl<'sm, '
     fn try_send_packet(&mut self, packet: TxPacket<P>) -> Result<(), Error> {
         let len = packet.total_size();
         trace!("[security manager] Send {} {}", packet.command, len);
-        self.connections.try_outbound(self.conn_handle, packet.into_pdu())?;
+        self.connections.try_outbound_smp(self.conn_handle, packet.into_pdu())?;
         let _ = self.events.try_send(SecurityEventData::TimerChange);
         Ok(())
     }
