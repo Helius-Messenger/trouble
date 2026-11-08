@@ -116,6 +116,15 @@ pub(crate) struct ConnectionManager<'d, P: PacketPool> {
     #[cfg(feature = "per-connection-address")]
     adv_handles: &'d RefCell<[AdvHandleState]>,
     outbound: Channel<NoopRawMutex, (ConnHandle, Pdu<P::Packet>), { config::L2CAP_TX_QUEUE_SIZE }>,
+    /// SMP's own TX lane, drained ahead of [`Self::outbound`]. The security
+    /// manager runs synchronously and can only `try_send`, while GATT
+    /// notifications `send().await` into `outbound` and keep it full through a
+    /// connect-time burst — so a pairing reply on the shared queue lost the race
+    /// and was dropped (`[smp] Failed to send public key OutOfMemory`, then the
+    /// PairingFailed fallback too: nothing on air, the central timed out after
+    /// 30 s). Notifications can never occupy this lane.
+    #[cfg(feature = "security")]
+    smp_outbound: Channel<NoopRawMutex, (ConnHandle, Pdu<P::Packet>), SMP_TX_QUEUE_SIZE>,
     #[cfg(feature = "security")]
     pub(crate) security_manager: SecurityManager<'d>,
 }
@@ -128,6 +137,11 @@ impl<P: PacketPool> Drop for ConnectionManager<'_, P> {
         }
     }
 }
+
+/// One pairing has at most a couple of SMP PDUs in flight per received
+/// command; 4 leaves headroom for two concurrent pairings.
+#[cfg(feature = "security")]
+const SMP_TX_QUEUE_SIZE: usize = 4;
 
 impl<'d, P: PacketPool> ConnectionManager<'d, P> {
     pub(crate) fn new(
@@ -146,6 +160,8 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
             #[cfg(feature = "per-connection-address")]
             adv_handles,
             outbound: Channel::new(),
+            #[cfg(feature = "security")]
+            smp_outbound: Channel::new(),
             #[cfg(feature = "security")]
             security_manager: SecurityManager::new(bond_storage),
         }
@@ -767,7 +783,26 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
         self.outbound.try_send((handle, pdu)).map_err(|_| Error::OutOfMemory)
     }
 
+    /// Queue an SMP PDU on its dedicated lane (see [`Self::smp_outbound`]).
+    #[cfg(feature = "security")]
+    pub(crate) fn try_outbound_smp(&self, handle: ConnHandle, pdu: Pdu<P::Packet>) -> Result<(), Error> {
+        self.smp_outbound
+            .try_send((handle, pdu))
+            .map_err(|_| Error::OutOfMemory)
+    }
+
+    /// Next PDU to transmit — SMP first, so pairing never waits behind data.
     pub(crate) async fn outbound(&self) -> (ConnHandle, Pdu<P::Packet>) {
+        #[cfg(feature = "security")]
+        {
+            if let Ok(smp) = self.smp_outbound.try_receive() {
+                return smp;
+            }
+            match embassy_futures::select::select(self.smp_outbound.receive(), self.outbound.receive()).await {
+                embassy_futures::select::Either::First(x) | embassy_futures::select::Either::Second(x) => x,
+            }
+        }
+        #[cfg(not(feature = "security"))]
         self.outbound.receive().await
     }
 

@@ -2239,7 +2239,13 @@ mod tests {
         assert!(mgr.security_manager.is_pairing_in_progress(peer()));
         assert_eq!(ch.try_notify(&gatt, &[3, 4], true), Err(Error::Busy));
         assert_eq!(unwrap!(server.table().get(&ch)), [3, 4]);
-        // One security request was queued; the second call sent nothing.
-        assert_eq!(fill_outbound(&mgr), config::L2CAP_TX_QUEUE_SIZE - 1);
+        // One security request was queued, on the SMP lane (not the shared queue); the
+        // second call sent nothing.
+        let Poll::Ready((_, pdu)) = embassy_futures::poll_once(mgr.outbound()) else {
+            panic!("expected the security request");
+        };
+        assert_eq!(pdu.as_ref()[2..5], [0x06, 0x00, 0x0b]); // SMP CID, Security Request
+        assert!(embassy_futures::poll_once(mgr.outbound()).is_pending());
+        assert_eq!(fill_outbound(&mgr), config::L2CAP_TX_QUEUE_SIZE);
     }
 }
